@@ -89,7 +89,6 @@ impl AncillaryData {
         self.event
     }
 
-
     pub fn time(&self) -> u64 {
         match self.event {
             Some(event) => {
@@ -307,7 +306,6 @@ pub struct EtwSession {
 
     /* Callbacks */
     event_error_callback: Option<Box<dyn Fn(&Event, &anyhow::Error)>>,
-    raw_event_callback: Option<Box<dyn FnMut(&EVENT_RECORD)>>,
     built_callbacks: Option<Vec<SessionClosure>>,
     starting_callbacks: Option<Vec<SendClosure>>,
     started_callbacks: Option<Vec<SendClosure>>,
@@ -368,7 +366,6 @@ impl EtwSession {
 
             /* Callbacks */
             event_error_callback: None,
-            raw_event_callback: None,
             built_callbacks: Some(Vec::new()),
             starting_callbacks: Some(Vec::new()),
             started_callbacks: Some(Vec::new()),
@@ -427,16 +424,6 @@ impl EtwSession {
         &mut self,
         callback: impl Fn(&Event, &anyhow::Error) + 'static) {
         self.event_error_callback = Some(Box::new(callback));
-    }
-
-    /// Set a callback that is invoked for **every** raw `EVENT_RECORD`
-    /// received from `ProcessTrace`, regardless of whether a matching
-    /// event handler is registered. This runs on the `ProcessTrace`
-    /// thread before the normal event routing.
-    pub fn set_raw_event_callback(
-        &mut self,
-        callback: impl FnMut(&EVENT_RECORD) + 'static) {
-        self.raw_event_callback = Some(Box::new(callback));
     }
 
     pub fn add_built_callback(
@@ -1193,17 +1180,11 @@ impl EtwSession {
 
         let ancillary = self.ancillary.clone();
         let error_callback = self.event_error_callback.take();
-        let mut raw_event_callback = self.raw_event_callback.take();
         let mut errors = Vec::new();
         let has_pid_filter = !pid_lookup.is_empty();
         let has_cpu_filter = target_cpus.is_some();
 
         let result = session.process(Box::new(move |event| {
-            /* Invoke raw event callback for every event, if set */
-            if let Some(ref mut callback) = raw_event_callback {
-                callback(event);
-            }
-
             let cpu_index = event.ProcessorIndex;
 
             /* Find events by provider ID */
