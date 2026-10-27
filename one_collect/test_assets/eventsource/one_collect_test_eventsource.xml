@@ -1,0 +1,110 @@
+<instrumentationManifest xmlns="http://schemas.microsoft.com/win/2004/08/events">
+ <instrumentation xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:win="http://manifests.microsoft.com/win/2004/08/windows/events">
+  <events xmlns="http://schemas.microsoft.com/win/2004/08/events">
+<provider name="OneCollect-Test-InbandManifest" guid="{369e340b-d54c-5d95-1211-b7a318f16882}" resourceFileName="OneCollectTest.dll" messageFileName="OneCollectTest.dll" symbol="OneCollectTestInbandManifest">
+ <tasks>
+  <task name="Request" message="$(string.task_Request)" value="1"/>
+  <task name="Versioned" message="$(string.task_Versioned)" value="65526"/>
+  <task name="Ping" message="$(string.task_Ping)" value="65529"/>
+  <task name="Blob" message="$(string.task_Blob)" value="65530"/>
+  <task name="Misc" message="$(string.task_Misc)" value="65531"/>
+  <task name="Strings" message="$(string.task_Strings)" value="65532"/>
+  <task name="AllScalars" message="$(string.task_AllScalars)" value="65533"/>
+  <task name="EventSourceMessage" message="$(string.task_EventSourceMessage)" value="65534"/>
+ </tasks>
+ <maps>
+  <valueMap name="TestColor">
+   <map value="0x0" message="$(string.map_TestColor.Red)"/>
+   <map value="0x1" message="$(string.map_TestColor.Green)"/>
+   <map value="0x2" message="$(string.map_TestColor.Blue)"/>
+  </valueMap>
+ </maps>
+ <opcodes>
+ </opcodes>
+ <keywords>
+  <keyword name="Session3" message="$(string.keyword_Session3)" mask="0x100000000000"/>
+  <keyword name="Session2" message="$(string.keyword_Session2)" mask="0x200000000000"/>
+  <keyword name="Session1" message="$(string.keyword_Session1)" mask="0x400000000000"/>
+  <keyword name="Session0" message="$(string.keyword_Session0)" mask="0x800000000000"/>
+ </keywords>
+ <events>
+  <event value="0" version="0" level="win:LogAlways" symbol="EventSourceMessage" task="EventSourceMessage" template="EventSourceMessageArgs"/>
+  <event value="1" version="0" level="win:Informational" symbol="AllScalars" task="AllScalars" template="AllScalarsArgs"/>
+  <event value="2" version="0" level="win:Informational" symbol="Strings" task="Strings" template="StringsArgs"/>
+  <event value="3" version="0" level="win:Informational" symbol="Misc" task="Misc" template="MiscArgs"/>
+  <event value="4" version="0" level="win:Informational" symbol="Blob" task="Blob" template="BlobArgs"/>
+  <event value="5" version="0" level="win:Informational" symbol="Ping" task="Ping"/>
+  <event value="6" version="0" level="win:Informational" symbol="RequestStart" opcode="win:Start" task="Request" template="RequestStartArgs"/>
+  <event value="7" version="0" level="win:Informational" symbol="RequestStop" opcode="win:Stop" task="Request" template="RequestStopArgs"/>
+  <event value="8" version="2" level="win:Informational" symbol="Versioned" task="Versioned" template="VersionedArgs"/>
+ </events>
+ <templates>
+  <template tid="EventSourceMessageArgs">
+   <data name="message" inType="win:UnicodeString"/>
+  </template>
+  <template tid="AllScalarsArgs">
+   <data name="s8" inType="win:Int8"/>
+   <data name="u8" inType="win:UInt8"/>
+   <data name="s16" inType="win:Int16"/>
+   <data name="u16" inType="win:UInt16"/>
+   <data name="s32" inType="win:Int32"/>
+   <data name="u32" inType="win:UInt32"/>
+   <data name="s64" inType="win:Int64"/>
+   <data name="u64" inType="win:UInt64"/>
+   <data name="f32" inType="win:Float"/>
+   <data name="f64" inType="win:Double"/>
+   <data name="b" inType="win:Boolean"/>
+   <data name="c" inType="win:UInt16"/>
+  </template>
+  <template tid="StringsArgs">
+   <data name="first" inType="win:UnicodeString"/>
+   <data name="empty" inType="win:UnicodeString"/>
+   <data name="after" inType="win:Int32"/>
+  </template>
+  <template tid="MiscArgs">
+   <data name="g" inType="win:GUID"/>
+   <data name="when" inType="win:FILETIME"/>
+   <data name="ptr" inType="win:Pointer"/>
+   <data name="color" inType="win:UInt32" map="TestColor"/>
+  </template>
+  <template tid="BlobArgs">
+   <data name="before" inType="win:Int32"/>
+   <data name="dataSize" inType="win:UInt32"/>
+   <data name="data" inType="win:Binary" length="dataSize"/>
+   <data name="after" inType="win:Int32"/>
+  </template>
+  <template tid="RequestStartArgs">
+   <data name="requestId" inType="win:Int32"/>
+  </template>
+  <template tid="RequestStopArgs">
+   <data name="requestId" inType="win:Int32"/>
+  </template>
+  <template tid="VersionedArgs">
+   <data name="value" inType="win:Int32"/>
+  </template>
+ </templates>
+</provider>
+</events>
+</instrumentation>
+<localization>
+ <resources culture="en-US">
+  <stringTable>
+   <string id="keyword_Session0" value="Session0"/>
+   <string id="keyword_Session1" value="Session1"/>
+   <string id="keyword_Session2" value="Session2"/>
+   <string id="keyword_Session3" value="Session3"/>
+   <string id="map_TestColor.Blue" value="Blue"/>
+   <string id="map_TestColor.Green" value="Green"/>
+   <string id="map_TestColor.Red" value="Red"/>
+   <string id="task_AllScalars" value="AllScalars"/>
+   <string id="task_Blob" value="Blob"/>
+   <string id="task_EventSourceMessage" value="EventSourceMessage"/>
+   <string id="task_Misc" value="Misc"/>
+   <string id="task_Ping" value="Ping"/>
+   <string id="task_Request" value="Request"/>
+   <string id="task_Strings" value="Strings"/>
+   <string id="task_Versioned" value="Versioned"/>
+  </stringTable>
+ </resources>
+</localization>
+</instrumentationManifest>

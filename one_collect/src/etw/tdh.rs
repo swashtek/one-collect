@@ -12,20 +12,35 @@
 //! ## Design
 //!
 //! The decoder caches the [`EventFormat`] directly.  TraceLogging schemas
-//! are keyed by their raw inline schema bytes; manifest schemas by their
-//! `(Provider GUID, Id, Version)` identity.  Both keyspaces are split by
-//! pointer width and index into one shared, append-only arena of decoded
-//! schemas.  Because the format uses the framework's standard `LocationType`
+//! are keyed by their raw inline schema bytes; OS-registered manifest schemas
+//! by their `(Provider GUID, Id, Version)` identity; in-band EventSource
+//! schemas by `(ManifestId, Id, Version)`, where `ManifestId` identifies one
+//! distinct manifest content.  All keyspaces are split by pointer width and
+//! index into one shared arena of decoded schemas (append-only, except that
+//! slots of evicted in-band manifests are recycled).  Because the format uses
+//! the framework's standard `LocationType`
 //! conventions (`StaticString`, `StaticUTF16String`, etc. with `size = 0`
 //! for variable-length fields), the cached `EventFormat` is schema-stable:
 //! it doesn't depend on any particular event's payload bytes.  A cache hit
 //! collapses to a hashmap probe + `EventData::new`, effectively zero
 //! per-event overhead.
 //!
-//! Source selection is transparent: [`TdhDecoder::decode`] takes the
-//! TraceLogging path when an inline SCHEMA_TL item is present and the
-//! manifest path otherwise.  `TdhGetEventInformation` is the same entry
-//! point for both, so the byte-level decoding is entirely source-agnostic.
+//! Source selection is transparent and happens per event in
+//! [`TdhDecoder::decode`]:
+//!
+//! 1. An event carrying an inline SCHEMA_TL item takes the **TraceLogging**
+//!    path, even when its provider also emitted an in-band manifest (an
+//!    `EventSource` may write some events via TraceLogging).
+//! 2. Classic (MOF/WBEM) events are rejected as `Unsupported`.
+//! 3. An **EventSource in-band manifest chunk** (`Id 0xFFFE`, `Opcode 0xFE`,
+//!    `Task 0xFFFE`) is consumed as schema metadata and reported as
+//!    [`TdhDecodeError::InbandManifest`]; it never reaches TDH.
+//! 4. An event defined by a reassembled **in-band manifest** for its
+//!    `(provider, process)` is decoded from that manifest.
+//! 5. Anything else takes the **OS-registered manifest** path.
+//!
+//! TraceLogging and OS-registered manifests share `TdhGetEventInformation`
+//! as their schema source, so their byte-level decoding is source-agnostic.
 //!
 //! Variable-length field resolution (scanning for null terminators, reading
 //! length prefixes) is handled lazily by the framework's existing
@@ -34,46 +49,52 @@
 //!
 //! ## Scope
 //!
-//! - **Supported**: TraceLogging, TraceLoggingDynamic, and manifest-based
-//!   events, nested struct fields (flattened with dot-notation names), basic
-//!   scalar and string property types, 32-bit and 64-bit event payloads.
+//! - **Supported**: TraceLogging, TraceLoggingDynamic, OS-registered
+//!   manifest, and .NET `EventSource` in-band manifest events; nested struct
+//!   fields (flattened with dot-notation names), basic scalar and string
+//!   property types, EventSource `byte[]` (u32-length-prefixed blobs),
+//!   32-bit and 64-bit event payloads.
 //!
 //! - **Not supported**: classic (MOF/WBEM) and WPP events (fast-rejected /
 //!   returned as `Unsupported`).
 //!
 //! - **Not yet supported** (future work): map / enum value resolution,
 //!   array-typed properties, and properties whose length or count is given
-//!   by another property.
+//!   by another (non-adjacent) property.
 //!
-//! ## "Manifest" here means *OS-registered*, not EventSource in-band
+//! ## OS-registered manifests
 //!
-//! The manifest path resolves schemas exclusively through
+//! The OS-registered manifest path resolves schemas through
 //! `TdhGetEventInformation`, which consults manifests registered with the OS
 //! (`HKLM\...\WINEVT\Publishers`, the `wevtutil im` model, e.g.
-//! `Microsoft-Windows-Kernel-*` and the .NET runtime providers).  It does
-//! **not** support .NET `EventSource` providers running in their default
-//! manifest mode, where the manifest is *not* OS-registered but is emitted
-//! **in-band** as special chunked "manifest events" (`EVENT_DESCRIPTOR.Id ==
-//! 0xFFFE`, `Opcode == 0xFE`).  For those providers `TdhGetEventInformation`
-//! returns `ERROR_NOT_FOUND`, so `decode()` returns
-//! [`TdhDecodeError::NotFound`].  Decoding them requires capturing and
-//! reassembling the in-band manifest chunks and parsing the XML, a separate
-//! subsystem tracked as future work.  Custom `EventSource` providers that use
-//! *self-describing* (TraceLogging) mode are decoded via the TraceLogging
-//! path and are unaffected.
+//! `Microsoft-Windows-Kernel-*`).  The provider's manifest must be registered
+//! on the *decoding* machine; if it isn't, `decode()` returns
+//! [`TdhDecodeError::NotFound`].  Negative results are not cached, so a
+//! manifest registered after the decoder starts is picked up on the next
+//! matching event.
 //!
-//! Manifest decoding requires the provider's manifest to be registered on
-//! the *decoding* machine; if it isn't, `TdhGetEventInformation` returns
-//! `ERROR_NOT_FOUND` and `decode()` returns [`TdhDecodeError::NotFound`].
-//! Negative results are not cached, so a manifest registered after the
-//! decoder starts is picked up on the next matching event.
+//! ## EventSource in-band manifests
+//!
+//! .NET `EventSource` providers in their default (manifest) mode do not
+//! register their manifest with the OS; they emit it in-band as chunked
+//! events whenever a session enables them.  The decoder reassembles the
+//! chunks per emitting thread, parses the XML, and binds the manifest to the
+//! emitting process, so processes running different builds of the same
+//! `EventSource` each decode with their own layout (see the `eventsource`
+//! module).  Events that arrive before their manifest is complete fall
+//! through to the OS-registered path (normally `NotFound`).  Once an in-band
+//! manifest is available it takes precedence over an OS-registered manifest
+//! for the same provider.  Ingestion problems never fail the stream; they are
+//! counted in [`TdhDecoder::inband_manifest_stats`].
 
 use super::abi::{EVENT_RECORD, EventRecordExt};
+use super::eventsource::{self, InbandManifestStore, ManifestId, Resolved};
 use crate::Guid;
 use crate::event::{EventData, EventField, EventFormat, LocationType};
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
+use std::time::Instant;
 use tracing::{debug, trace, warn};
 use twox_hash::XxHash64;
 
@@ -165,7 +186,8 @@ pub enum TdhDecodeError {
     /// `EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL` extended-data item was
     /// present.  For manifest events this also covers "manifest not
     /// registered on this machine" (`TdhGetEventInformation` returns
-    /// `ERROR_NOT_FOUND`).
+    /// `ERROR_NOT_FOUND`), including EventSource events that arrive before
+    /// their in-band manifest has been fully received.
     NotFound,
     /// The event's schema source is recognised but not supported by this
     /// decoder (e.g. classic (MOF/WBEM) events, which are fast-rejected
@@ -176,6 +198,16 @@ pub enum TdhDecodeError {
     Win32(u32),
     /// The `TRACE_EVENT_INFO` returned by TDH is structurally invalid.
     Malformed(&'static str),
+    /// The event is an EventSource in-band manifest chunk (`Id 0xFFFE`,
+    /// `Opcode 0xFE`, `Task 0xFFFE`).  It was consumed as schema metadata
+    /// and has no payload to decode.
+    ///
+    /// Returned for **every** such event, whether or not the chunk was
+    /// accepted, so consumers can drop all manifest metadata with one rule.
+    /// Ingestion problems are reported via
+    /// [`TdhDecoder::inband_manifest_stats`].  Diagnostic consumers still
+    /// hold the raw `EVENT_RECORD` and may forward it.
+    InbandManifest,
 }
 
 impl std::fmt::Display for TdhDecodeError {
@@ -185,11 +217,65 @@ impl std::fmt::Display for TdhDecodeError {
             Self::Unsupported => write!(f, "event schema source is not supported"),
             Self::Win32(code) => write!(f, "TdhGetEventInformation failed with Win32 error {code}"),
             Self::Malformed(msg) => write!(f, "malformed TRACE_EVENT_INFO: {msg}"),
+            Self::InbandManifest => write!(f, "EventSource in-band manifest event (schema metadata, no payload)"),
         }
     }
 }
 
 impl std::error::Error for TdhDecodeError {}
+
+// ── Public metadata types ───────────────────────────────────────────
+
+/// Which schema source decoded an event.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SchemaSourceKind {
+    /// Inline TraceLogging / TraceLoggingDynamic schema (SCHEMA_TL).
+    TraceLogging,
+    /// Manifest registered with the OS, resolved via `TdhGetEventInformation`.
+    RegisteredManifest,
+    /// .NET `EventSource` manifest received in-band in the event stream.
+    InbandManifest,
+}
+
+/// Cumulative counters for EventSource in-band manifest ingestion.
+///
+/// Obtained from [`TdhDecoder::inband_manifest_stats`].  All counters only
+/// ever increase, so consumers can publish deltas between snapshots.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InbandManifestStats {
+    /// Manifest chunk events seen (accepted or not).
+    pub chunks: u64,
+    /// Manifests fully reassembled from chunks.
+    pub manifests_completed: u64,
+    /// Distinct manifest contents parsed and stored (identical re-sends are
+    /// not re-parsed and do not count).
+    pub manifests_interned: u64,
+    /// Chunks with an invalid envelope (bad magic, format, version, range).
+    pub envelope_errors: u64,
+    /// Reassembled manifests rejected as malformed XML, non-UTF-8, over a
+    /// limit, or not matching the emitting provider GUID.
+    pub xml_errors: u64,
+    /// Non-zero chunks discarded because their emission's chunk 0 was not
+    /// seen (e.g. lost, or collection started mid-emission).
+    pub orphan_chunks: u64,
+    /// Partial manifests abandoned (restarted, duplicate or mismatched chunk,
+    /// too large, expired, or evicted).
+    pub partials_dropped: u64,
+    /// `(provider, process)` bindings evicted because the store was full.
+    pub bindings_evicted: u64,
+    /// Stored manifests freed because the store was full.
+    pub manifests_evicted: u64,
+}
+
+impl InbandManifestStats {
+    /// Sum of the counters that indicate a manifest was (partially) lost:
+    /// envelope errors, rejected manifests, orphan chunks and dropped partials.
+    pub fn ingest_errors(&self) -> u64 {
+        self.envelope_errors + self.xml_errors + self.orphan_chunks + self.partials_dropped
+    }
+}
 
 // ── Cached schema ───────────────────────────────────────────────────
 
@@ -197,7 +283,8 @@ impl std::error::Error for TdhDecodeError {}
 /// framework's `try_get_field_data_closure` can resolve lazily.
 #[derive(Clone)]
 struct CachedSchema {
-    /// The event name (TraceLogging event name or manifest task name).
+    /// The event name (TraceLogging event name, manifest task name, or
+    /// EventSource event `symbol`).
     event_name: String,
     /// Schema-stable `EventFormat`: field offsets are absolute for
     /// fixed-size fields, and the framework's skip chain handles
@@ -205,6 +292,10 @@ struct CachedSchema {
     format: EventFormat,
     /// Monotonic ID assigned at insertion time.
     schema_id: SchemaId,
+    /// Provider name from the schema source, when known.
+    provider_name: Option<String>,
+    /// Which schema source produced this schema.
+    source: SchemaSourceKind,
 }
 
 /// Hash builder using XxHash64, matching the rest of the ETW module.
@@ -235,30 +326,52 @@ struct ManifestEventKey {
     version: u8,
 }
 
-/// Schema cache: one append-only `Vec` arena of decoded schemas shared by
-/// both schema sources, indexed by per-source, per-pointer-width maps.
+/// Identity of an in-band EventSource event's schema.
 ///
-/// TraceLogging is keyed by its raw inline schema bytes; manifest events by
-/// their `(Provider, Id, Version)` [`ManifestEventKey`].  The two sources use
+/// `manifest` identifies one distinct manifest *content* (see the
+/// `eventsource` module), so processes sending identical manifests share
+/// cache entries, while differing builds of the same provider never alias.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+struct InbandEventKey {
+    manifest: ManifestId,
+    id: u16,
+    version: u8,
+}
+
+/// Schema cache: one `Vec` arena of decoded schemas shared by all schema
+/// sources, indexed by per-source, per-pointer-width maps.
+///
+/// TraceLogging is keyed by its raw inline schema bytes; OS-registered
+/// manifest events by their `(Provider, Id, Version)` [`ManifestEventKey`];
+/// in-band EventSource events by [`InbandEventKey`].  The sources use
 /// different key *types*, so they need separate maps (a `HashMap` is
 /// monomorphic in its key), but the decoded [`CachedSchema`] is source-
-/// agnostic, so storage stays unified in one arena.  Because the arena is
-/// append-only, an index handed out by any map stays valid for the life of
-/// the cache, and TL and manifest entries can never alias the same slot.
+/// agnostic, so storage stays unified in one arena.
+///
+/// TraceLogging and OS-manifest slots are never removed, so their indices
+/// stay valid for the life of the cache.  In-band slots are released when
+/// their manifest is evicted from the in-band store ([`Self::remove_inband`])
+/// and recycled through `free`; their map entries are removed at the same
+/// time, so no live map entry ever points at a recycled slot.
 ///
 /// Storing a `Copy` index (rather than the schema inline in the map) lets the
 /// hot path hash the key exactly once: the index is copied out, ending the
 /// map borrow, and the schema is then read from `schemas`.
 struct SchemaCache {
-    /// Decoded schemas, indexed by the maps below.  Append-only: entries are
-    /// never removed, so an index stays valid for the life of the cache.
-    schemas: Vec<CachedSchema>,
+    /// Decoded schemas, indexed by the maps below.  `None` only for recycled
+    /// in-band slots awaiting reuse.
+    schemas: Vec<Option<CachedSchema>>,
+    /// Indices of released (`None`) slots available for reuse.
+    free: Vec<usize>,
     /// TraceLogging schema bytes → arena index (64-bit / 32-bit payloads).
     tl_64: HashMap<Vec<u8>, usize, XxBuildHasher>,
     tl_32: HashMap<Vec<u8>, usize, XxBuildHasher>,
     /// Manifest `(Provider, Id, Version)` → arena index (64/32-bit payloads).
     manifest_64: HashMap<ManifestEventKey, usize, XxBuildHasher>,
     manifest_32: HashMap<ManifestEventKey, usize, XxBuildHasher>,
+    /// In-band `(ManifestId, Id, Version)` → arena index (64/32-bit payloads).
+    inband_64: HashMap<InbandEventKey, usize, XxBuildHasher>,
+    inband_32: HashMap<InbandEventKey, usize, XxBuildHasher>,
     /// Manifest keys whose decoding source is permanently unsupported
     /// (WPP / WBEM reached via the manifest dispatch path).  Caching these
     /// avoids a `TdhGetEventInformation` round trip on every subsequent event
@@ -273,11 +386,29 @@ impl SchemaCache {
     fn new() -> Self {
         Self {
             schemas: Vec::new(),
+            free: Vec::new(),
             tl_64: HashMap::with_hasher(XxBuildHasher::default()),
             tl_32: HashMap::with_hasher(XxBuildHasher::default()),
             manifest_64: HashMap::with_hasher(XxBuildHasher::default()),
             manifest_32: HashMap::with_hasher(XxBuildHasher::default()),
+            inband_64: HashMap::with_hasher(XxBuildHasher::default()),
+            inband_32: HashMap::with_hasher(XxBuildHasher::default()),
             manifest_unsupported: HashSet::with_hasher(XxBuildHasher::default()),
+        }
+    }
+
+    /// Releases every cached schema built from in-band manifest `manifest`
+    /// (both pointer widths), making their slots available for reuse.
+    fn remove_inband(&mut self, manifest: ManifestId) {
+        for map in [&mut self.inband_64, &mut self.inband_32] {
+            map.retain(|key, idx| {
+                if key.manifest != manifest {
+                    return true;
+                }
+                self.schemas[*idx] = None;
+                self.free.push(*idx);
+                false
+            });
         }
     }
 
@@ -301,6 +432,10 @@ impl SchemaCache {
                 let map = if is_32bit { &self.manifest_32 } else { &self.manifest_64 };
                 map.get(key).copied()
             }
+            SchemaSource::Inband(key) => {
+                let map = if is_32bit { &self.inband_32 } else { &self.inband_64 };
+                map.get(key).copied()
+            }
         }
     }
 
@@ -317,10 +452,10 @@ impl SchemaCache {
     /// Maps a schema source to a schema index and returns it.  Intended for
     /// the cache miss path, where the source is not yet present.
     ///
-    /// The schema is only pushed onto `schemas` when the key is actually
-    /// vacant, so a (contract-violating) duplicate key returns the existing
-    /// index without orphaning a freshly built schema.  The key is hashed
-    /// once via a single `entry` lookup.
+    /// The schema is only stored when the key is actually vacant, so a
+    /// (contract-violating) duplicate key returns the existing index without
+    /// orphaning a freshly built schema.  The key is hashed once via a single
+    /// `entry` lookup.  A vacant key takes a recycled slot if one is free.
     fn insert(
         &mut self,
         source: SchemaSource<'_>,
@@ -329,29 +464,47 @@ impl SchemaCache {
     ) -> usize {
         use std::collections::hash_map::Entry;
 
-        let idx = self.schemas.len();
+        // Picks a slot only once the key is known to be vacant.
+        fn store(
+            schemas: &mut Vec<Option<CachedSchema>>,
+            free: &mut Vec<usize>,
+            schema: CachedSchema,
+        ) -> usize {
+            match free.pop() {
+                Some(idx) => {
+                    schemas[idx] = Some(schema);
+                    idx
+                }
+                None => {
+                    schemas.push(Some(schema));
+                    schemas.len() - 1
+                }
+            }
+        }
+
+        let schemas = &mut self.schemas;
+        let free = &mut self.free;
         match source {
             SchemaSource::TraceLogging(key) => {
                 let map = if is_32bit { &mut self.tl_32 } else { &mut self.tl_64 };
                 match map.entry(key.to_vec()) {
                     // Already present: return the existing index and drop `schema`.
                     Entry::Occupied(e) => *e.get(),
-                    Entry::Vacant(e) => {
-                        let assigned = *e.insert(idx); // ends the map borrow
-                        self.schemas.push(schema); // only push once actually indexed
-                        assigned
-                    }
+                    Entry::Vacant(e) => *e.insert(store(schemas, free, schema)),
                 }
             }
             SchemaSource::Manifest(key) => {
                 let map = if is_32bit { &mut self.manifest_32 } else { &mut self.manifest_64 };
                 match map.entry(key) {
                     Entry::Occupied(e) => *e.get(),
-                    Entry::Vacant(e) => {
-                        let assigned = *e.insert(idx); // ends the map borrow
-                        self.schemas.push(schema); // only push once actually indexed
-                        assigned
-                    }
+                    Entry::Vacant(e) => *e.insert(store(schemas, free, schema)),
+                }
+            }
+            SchemaSource::Inband(key) => {
+                let map = if is_32bit { &mut self.inband_32 } else { &mut self.inband_64 };
+                match map.entry(key) {
+                    Entry::Occupied(e) => *e.get(),
+                    Entry::Vacant(e) => *e.insert(store(schemas, free, schema)),
                 }
             }
         }
@@ -359,11 +512,11 @@ impl SchemaCache {
 
     /// Reads a cached schema by its index.
     ///
-    /// `idx` always comes from an `index_of` or `insert` call, and
-    /// `schemas` is append-only (entries are never removed), so the index
-    /// never dangles.
+    /// `idx` always comes from an `index_of` or `insert` call.  Slots are
+    /// only released together with every map entry that points at them
+    /// ([`Self::remove_inband`]), so a live index never dangles.
     fn get(&self, idx: usize) -> &CachedSchema {
-        &self.schemas[idx]
+        self.schemas[idx].as_ref().expect("cache index refers to a live schema slot")
     }
 }
 
@@ -381,23 +534,27 @@ pub struct TdhDecodedEvent<'a> {
     /// The resolved event name, or `None` if the schema has no name.
     ///
     /// For TraceLogging this is the event name (the primary identity, as
-    /// the event ID is often 0); for manifest events it is the task name.
-    /// Consumers can use this for OTEL log record naming without a second
-    /// cache probe.
+    /// the event ID is often 0); for OS-registered manifest events it is the
+    /// task name; for EventSource in-band manifest events it is the event's
+    /// `symbol` (the EventSource method name, e.g. `RequestStart`), falling
+    /// back to the task name.  Consumers can use this for OTEL log record
+    /// naming without a second cache probe.
     ///
-    /// Note: for manifest events this is the Task name, which is not unique
-    /// per event (multiple events can share a Task, e.g. Start/Stop/Info
-    /// under one Task all report the same name).  Identity-sensitive
-    /// consumers (dedup, routing, record identity) should use `schema_id`
-    /// (or the event's `Id`/`Opcode`) rather than treating the name as unique.
+    /// Note: for OS-registered manifest events this is the Task name, which
+    /// is not unique per event (multiple events can share a Task, e.g.
+    /// Start/Stop/Info under one Task all report the same name).
+    /// Identity-sensitive consumers (dedup, routing, record identity) should
+    /// use `schema_id` (or the event's `Id`/`Opcode`) rather than treating
+    /// the name as unique.
     pub event_name: Option<&'a str>,
     /// Monotonic identifier for this event's schema.
     ///
-    /// Each distinct schema (identified by its inline TraceLogging bytes or
-    /// its manifest `(Provider, Id, Version)` tuple, split by pointer width)
-    /// gets a unique `SchemaId` on first insertion into the cache.  The same
-    /// ID is returned on every subsequent cache hit.  Exporters can use this as
-    /// a cheap lookup key to avoid re-registering the `EventFormat`:
+    /// Each distinct schema (identified by its inline TraceLogging bytes, its
+    /// OS manifest `(Provider, Id, Version)` tuple, or its in-band manifest
+    /// content and `(Id, Version)`, split by pointer width) gets a unique
+    /// `SchemaId` on first insertion into the cache.  The same ID is returned
+    /// on every subsequent cache hit.  Exporters can use this as a cheap
+    /// lookup key to avoid re-registering the `EventFormat`:
     ///
     /// ```ignore
     /// let event = decoder.decode(record)?;
@@ -405,6 +562,14 @@ pub struct TdhDecodedEvent<'a> {
     ///     .or_insert_with(|| exporter.register(event.event_data.format()));
     /// ```
     pub schema_id: SchemaId,
+    /// The provider name from the schema source, when known.
+    ///
+    /// `Some` for EventSource in-band manifest events (the manifest's
+    /// `<provider name>`); currently `None` for TraceLogging and
+    /// OS-registered manifest events.
+    pub provider_name: Option<&'a str>,
+    /// Which schema source decoded this event.
+    pub source: SchemaSourceKind,
 }
 
 /// Opaque monotonic identifier for a cached TDH schema.
@@ -426,10 +591,16 @@ enum SchemaSource<'a> {
     TraceLogging(&'a [u8]),
     /// Manifest event, keyed by its `(Provider, Id, Version)` identity.
     Manifest(ManifestEventKey),
+    /// EventSource in-band manifest event, keyed by manifest content + `(Id, Version)`.
+    Inband(InbandEventKey),
 }
 
-/// Runtime decoder for TraceLogging, TraceLoggingDynamic, and
-/// manifest-based ETW events.
+/// How many `decode()` calls pass between amortized sweeps of expired
+/// partial in-band manifests.
+const INBAND_SWEEP_INTERVAL: u64 = 4096;
+
+/// Runtime decoder for TraceLogging, TraceLoggingDynamic, OS-registered
+/// manifest, and .NET `EventSource` in-band manifest ETW events.
 ///
 /// Caches the `EventFormat` directly per schema.  Cache hits are a
 /// hashmap probe + `EventData::new` with no per-event allocation.
@@ -439,7 +610,18 @@ pub struct TdhDecoder {
     tei_buf: AlignedTeiBuf,
     /// Monotonic counter for assigning unique `SchemaId`s.
     next_schema_id: u64,
+    /// EventSource in-band manifest assembly and storage.
+    inband: InbandManifestStore,
+    /// OS-manifest keys confirmed `NotFound` while an agreed fallback
+    /// in-band manifest exists (see [`Resolved::Fallback`]).  Lets later
+    /// events use the fallback without a `TdhGetEventInformation` call.
+    os_manifest_absent: HashSet<ManifestEventKey, XxBuildHasher>,
+    /// `decode()` call counter driving the amortized partial-manifest sweep.
+    decode_calls: u64,
 }
+
+/// Bound on [`TdhDecoder::os_manifest_absent`]; the set is cleared when full.
+const MAX_OS_MANIFEST_ABSENT: usize = 65536;
 
 impl TdhDecoder {
     /// Creates a new decoder with an empty schema cache.
@@ -448,25 +630,32 @@ impl TdhDecoder {
             cache: SchemaCache::new(),
             tei_buf: AlignedTeiBuf::new(),
             next_schema_id: 0,
+            inband: InbandManifestStore::default(),
+            os_manifest_absent: HashSet::with_hasher(XxBuildHasher::default()),
+            decode_calls: 0,
         }
+    }
+
+    /// Returns cumulative EventSource in-band manifest ingestion counters.
+    pub fn inband_manifest_stats(&self) -> InbandManifestStats {
+        self.inband.stats()
     }
 
     /// Decodes an `EVENT_RECORD` into a [`TdhDecodedEvent`].
     ///
-    /// The schema source is selected automatically: an event carrying an
-    /// inline `EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL` item takes the
-    /// TraceLogging path; otherwise the event is treated as manifest-based
-    /// and resolved through its `(Provider, Id, Version)` identity.  Both
-    /// paths converge on the same `TdhGetEventInformation` walker and the
-    /// same [`EventData`] construction.
+    /// The schema source is selected per event (see the module docs):
+    /// an inline `EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL` item selects the
+    /// TraceLogging path; an EventSource manifest-chunk event is consumed and
+    /// reported as [`TdhDecodeError::InbandManifest`]; an event defined by an
+    /// in-band EventSource manifest for its `(provider, process)` is decoded
+    /// from that manifest; anything else is resolved as an OS-registered
+    /// manifest event through its `(Provider, Id, Version)` identity.
     ///
     /// All cache interaction is centralized here: the source is classified,
     /// the cache is probed, and only on a miss is a `decode_*` helper called
     /// to perform a real decode.  The freshly built schema is then assigned a
     /// `SchemaId` and inserted — so the helpers never touch the positive
-    /// cache themselves.  This keeps a single insertion point, which future
-    /// sources (e.g. injected EventSource manifests) can reuse without going
-    /// through a `decode_*` path.
+    /// cache themselves.
     ///
     /// The returned [`TdhDecodedEvent`] contains the decoded
     /// [`EventData`], the resolved `event_name`, and a monotonic
@@ -478,49 +667,71 @@ impl TdhDecoder {
     ) -> Result<TdhDecodedEvent<'a>, TdhDecodeError> {
         let is_32bit = (record.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
 
-        // Classify the schema source and compute its cache key.  This borrows
-        // only `record`, never `self`, so the mutable `self` borrows below are
-        // unconstrained.
+        self.decode_calls = self.decode_calls.wrapping_add(1);
+        if self.decode_calls.is_multiple_of(INBAND_SWEEP_INTERVAL) && self.inband.has_partials() {
+            self.inband.sweep(Instant::now());
+        }
+
+        // Classify the schema source and compute its cache key.  The source
+        // borrows only `record`, never `self`, so the mutable `self` borrows
+        // below are unconstrained.
         //
         // Classic (MOF/WBEM) events are rejected here rather than in the
         // manifest path: their identity is a class GUID + Opcode, not the
         // `(Provider, Id, Version)` tuple (their `Id` is commonly `0`, so
         // multiple such events would collapse onto one key), so they can never
         // form a valid `ManifestEventKey`.
-        let source = match find_schema_tl(record) {
-            Some(schema_tl_bytes) => SchemaSource::TraceLogging(schema_tl_bytes),
+        //
+        // `fallback` is set when the only in-band manifest available is one
+        // the emitting process did not send itself.  Any process can emit
+        // manifest chunks under any provider GUID, so such a manifest is used
+        // only once the OS lookup confirms no registered manifest exists.
+        let (source, fallback) = match find_schema_tl(record) {
+            // SCHEMA_TL wins even for providers with an in-band manifest: an
+            // EventSource may write some events via TraceLogging.
+            Some(schema_tl_bytes) => (SchemaSource::TraceLogging(schema_tl_bytes), None),
             None => {
                 if (record.EventHeader.Flags & EVENT_HEADER_FLAG_CLASSIC_HEADER) != 0 {
                     return Err(TdhDecodeError::Unsupported);
                 }
                 let desc = &record.EventHeader.EventDescriptor;
-                SchemaSource::Manifest(ManifestEventKey {
-                    provider: record.provider_guid(),
-                    id: desc.Id,
-                    version: desc.Version,
-                })
+                let provider = record.provider_guid();
+
+                if eventsource::is_manifest_descriptor(desc.Id, desc.Opcode, desc.Task) {
+                    self.ingest_manifest_chunk(record, provider);
+                    return Err(TdhDecodeError::InbandManifest);
+                }
+
+                let os_key = ManifestEventKey { provider, id: desc.Id, version: desc.Version };
+                let inband_key = |manifest| InbandEventKey { manifest, id: desc.Id, version: desc.Version };
+
+                let pid = record.EventHeader.ProcessId;
+                match self.inband.resolve(provider, pid, desc.Id, desc.Version) {
+                    Some(Resolved::Bound(m)) => (SchemaSource::Inband(inband_key(m)), None),
+                    Some(Resolved::Fallback(m)) if self.os_manifest_absent.contains(&os_key) => {
+                        (SchemaSource::Inband(inband_key(m)), None)
+                    }
+                    Some(Resolved::Fallback(m)) => {
+                        (SchemaSource::Manifest(os_key), Some((os_key, inband_key(m))))
+                    }
+                    None => (SchemaSource::Manifest(os_key), None),
+                }
             }
         };
 
-        // Centralized caching: a hit reuses the arena slot; a miss performs a
-        // real decode, assigns a `SchemaId`, and inserts under the key.  The
-        // `usize` index is `Copy`, so every `self` borrow ends before the
-        // `self.cache.get(idx)` read below.
-        let idx = match self.cache.index_of(&source, is_32bit) {
-            Some(idx) => idx,
-            None => {
-                if let SchemaSource::Manifest(key) = &source {
-                    if self.cache.is_manifest_unsupported(key) {
-                        return Err(TdhDecodeError::Unsupported);
-                    }
+        let idx = match self.cached_or_decode(source, record, is_32bit) {
+            Ok(idx) => idx,
+            Err(TdhDecodeError::NotFound) if fallback.is_some() => {
+                let (os_key, inband_key) = fallback.expect("checked by guard");
+                // Remember the OS miss so later events skip the TDH round
+                // trip and go straight to the agreed in-band manifest.
+                if self.os_manifest_absent.len() >= MAX_OS_MANIFEST_ABSENT {
+                    self.os_manifest_absent.clear();
                 }
-                let mut schema = match &source {
-                    SchemaSource::TraceLogging(_) => self.decode_tracelogging(record, is_32bit)?,
-                    SchemaSource::Manifest(key) => self.decode_manifest(record, is_32bit, key)?,
-                };
-                schema.schema_id = SchemaId(self.assign_schema_id());
-                self.cache.insert(source, is_32bit, schema)
+                self.os_manifest_absent.insert(os_key);
+                self.cached_or_decode(SchemaSource::Inband(inband_key), record, is_32bit)?
             }
+            Err(e) => return Err(e),
         };
 
         let schema = self.cache.get(idx);
@@ -541,7 +752,92 @@ impl TdhDecoder {
             event_data: EventData::new(user_data, user_data, &schema.format),
             event_name,
             schema_id: schema.schema_id,
+            provider_name: schema.provider_name.as_deref(),
+            source: schema.source,
         })
+    }
+
+    /// Returns the cache index for `source`, performing a real decode and
+    /// inserting the schema on a miss.
+    ///
+    /// Centralized caching: a hit reuses the arena slot; a miss assigns a
+    /// `SchemaId` and inserts under the key.  Returning the `Copy` index ends
+    /// every `self` borrow before the caller reads the schema.
+    fn cached_or_decode(
+        &mut self,
+        source: SchemaSource<'_>,
+        record: &EVENT_RECORD,
+        is_32bit: bool,
+    ) -> Result<usize, TdhDecodeError> {
+        if let Some(idx) = self.cache.index_of(&source, is_32bit) {
+            return Ok(idx);
+        }
+
+        if let SchemaSource::Manifest(key) = &source {
+            if self.cache.is_manifest_unsupported(key) {
+                return Err(TdhDecodeError::Unsupported);
+            }
+        }
+
+        let mut schema = match &source {
+            SchemaSource::TraceLogging(_) => self.decode_tracelogging(record, is_32bit)?,
+            SchemaSource::Manifest(key) => self.decode_manifest(record, is_32bit, key)?,
+            SchemaSource::Inband(key) => self.decode_inband(key, is_32bit)?,
+        };
+        schema.schema_id = SchemaId(self.assign_schema_id());
+        Ok(self.cache.insert(source, is_32bit, schema))
+    }
+
+    /// Feeds an EventSource manifest chunk to the in-band store and purges
+    /// cached schemas of any manifests the store freed as a result.
+    fn ingest_manifest_chunk(&mut self, record: &EVENT_RECORD, provider: Guid) {
+        self.inband.ingest_chunk(
+            provider,
+            record.EventHeader.ProcessId,
+            record.EventHeader.ThreadId,
+            record.user_data_slice(),
+            Instant::now(),
+        );
+
+        let freed = self.inband.take_freed();
+        if !freed.is_empty() {
+            // Fallback decisions may refer to freed manifests; re-confirm.
+            self.os_manifest_absent.clear();
+        }
+        for manifest in freed {
+            self.cache.remove_inband(manifest);
+        }
+    }
+
+    /// Builds the schema for an in-band EventSource event after a cache miss.
+    fn decode_inband(
+        &self,
+        key: &InbandEventKey,
+        is_32bit: bool,
+    ) -> Result<CachedSchema, TdhDecodeError> {
+        // `resolve()` only returns manifests that define (id, version), and
+        // nothing is freed between resolve and here, so this cannot miss.
+        let (provider_name, def) = self.inband
+            .event(key.manifest, key.id, key.version)
+            .ok_or(TdhDecodeError::NotFound)?;
+
+        let schema = CachedSchema {
+            event_name: def.name.clone(),
+            format: eventsource::manifest::build_format(&def.fields, is_32bit),
+            schema_id: SchemaId(0), // assigned by caller
+            provider_name: Some(provider_name.to_string()),
+            source: SchemaSourceKind::InbandManifest,
+        };
+        debug!(
+            event_name = %schema.event_name,
+            id = key.id,
+            version = key.version,
+            manifest = key.manifest,
+            field_count = schema.format.fields().len(),
+            is_32bit,
+            "TDH schema cache miss — built EventSource in-band schema"
+        );
+        Ok(schema)
     }
 
     /// Performs a real TraceLogging decode after a cache miss, returning the
@@ -637,12 +933,19 @@ fn build_cached_schema(tei_buf: &[u8], is_32bit: bool) -> Result<CachedSchema, T
     let top_level_count = tei.TopLevelPropertyCount as usize;
 
     let event_name = read_event_name(tei_buf, tei);
+    let source = if tei.DecodingSource == DecodingSourceTlg {
+        SchemaSourceKind::TraceLogging
+    } else {
+        SchemaSourceKind::RegisteredManifest
+    };
 
     if property_count == 0 {
         return Ok(CachedSchema {
             event_name,
             format: EventFormat::new(),
             schema_id: SchemaId(0), // assigned by caller
+            provider_name: None,
+            source,
         });
     }
 
@@ -680,6 +983,8 @@ fn build_cached_schema(tei_buf: &[u8], is_32bit: bool) -> Result<CachedSchema, T
         event_name,
         format,
         schema_id: SchemaId(0), // assigned by caller
+        provider_name: None,
+        source,
     })
 }
 
@@ -1014,7 +1319,7 @@ fn read_utf16_at(buf: &[u8], byte_offset: usize) -> String {
 /// This is the single source of truth for the in-type → field-info
 /// mapping, used by both `walk_properties` (schema construction) and
 /// `intype_to_type_name` (explicit-length fallback).
-const fn intype_to_field_info(in_type: i32, is_32bit: bool) -> (&'static str, LocationType, usize) {
+pub(crate) const fn intype_to_field_info(in_type: i32, is_32bit: bool) -> (&'static str, LocationType, usize) {
     match in_type {
         // Fixed-size scalars
         TDH_INTYPE_INT8                          => ("s8",   LocationType::Static, 1),
@@ -1592,6 +1897,8 @@ mod tests {
             event_name: name.to_string(),
             format: EventFormat::new(),
             schema_id: SchemaId(0),
+            provider_name: None,
+            source: SchemaSourceKind::TraceLogging,
         };
         let key = ManifestEventKey {
             provider: Guid::from_u128(0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00),
@@ -1712,6 +2019,8 @@ mod tests {
             event_name: name.to_string(),
             format: EventFormat::new(),
             schema_id: SchemaId(0),
+            provider_name: None,
+            source: SchemaSourceKind::TraceLogging,
         };
 
         let mut cache = SchemaCache::new();
@@ -1734,5 +2043,332 @@ mod tests {
 
         // The 32-bit map is a separate keyspace: the same bytes miss there.
         assert_eq!(cache.index_of(&SchemaSource::TraceLogging(&[9, 8, 7]), true), None);
+    }
+
+    // ── EventSource in-band manifest dispatch tests ─────────────────
+
+    use super::super::eventsource::envelope::build_chunk;
+    use super::super::eventsource::manifest::{TEST_MANIFEST, TEST_PROVIDER};
+
+    /// Builds a non-TraceLogging record (no extended data) for `provider`.
+    fn es_record(
+        provider: Guid,
+        pid: u32,
+        (id, version, opcode, task): (u16, u8, u8, u16),
+        user_data: &[u8],
+    ) -> EVENT_RECORD {
+        let mut record: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        // SAFETY: `Guid` and `windows_sys::core::GUID` are layout-identical
+        // (asserted in `abi.rs`).
+        record.EventHeader.ProviderId = unsafe { std::mem::transmute::<Guid, windows_sys::core::GUID>(provider) };
+        record.EventHeader.ProcessId = pid;
+        record.EventHeader.ThreadId = 1;
+        record.EventHeader.EventDescriptor.Id = id;
+        record.EventHeader.EventDescriptor.Version = version;
+        record.EventHeader.EventDescriptor.Opcode = opcode;
+        record.EventHeader.EventDescriptor.Task = task;
+        record.UserData = user_data.as_ptr() as *mut std::ffi::c_void;
+        record.UserDataLength = user_data.len() as u16;
+        record
+    }
+
+    const MANIFEST_DESC: (u16, u8, u8, u16) = (0xFFFE, 1, 0xFE, 0xFFFE);
+
+    /// Sends `xml` as `chunks` manifest chunk events from `pid`, asserting
+    /// each is reported as `InbandManifest`.
+    fn feed_manifest(decoder: &mut TdhDecoder, provider: Guid, pid: u32, xml: &[u8], chunks: usize) {
+        let size = xml.len().div_ceil(chunks);
+        let parts: Vec<&[u8]> = xml.chunks(size).collect();
+        for (n, part) in parts.iter().enumerate() {
+            let payload = build_chunk(parts.len() as u16, n as u16, part);
+            let record = es_record(provider, pid, MANIFEST_DESC, &payload);
+            assert!(matches!(decoder.decode(&record), Err(TdhDecodeError::InbandManifest)));
+        }
+    }
+
+    fn values<'a>(event: &'a TdhDecodedEvent<'a>) -> Vec<(&'a str, &'a [u8])> {
+        event.event_data.format()
+            .fields_with_data(event.event_data.event_data())
+            .map(|(f, bytes)| (f.name.as_str(), bytes))
+            .collect()
+    }
+
+    fn utf16z(s: &str) -> Vec<u8> {
+        let mut out: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    #[test]
+    fn inband_manifest_decodes_all_scalars() {
+        let mut decoder = TdhDecoder::new();
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, TEST_MANIFEST.as_bytes(), 3);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(-8i8).to_le_bytes());
+        payload.extend_from_slice(&0xABu8.to_le_bytes());
+        payload.extend_from_slice(&(-1600i16).to_le_bytes());
+        payload.extend_from_slice(&0xBEEFu16.to_le_bytes());
+        payload.extend_from_slice(&(-32_000_000i32).to_le_bytes());
+        payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        payload.extend_from_slice(&(-6_400_000_000_000i64).to_le_bytes());
+        payload.extend_from_slice(&0x0102030405060708u64.to_le_bytes());
+        payload.extend_from_slice(&3.5f32.to_le_bytes());
+        payload.extend_from_slice(&2.25f64.to_le_bytes());
+        payload.extend_from_slice(&1i32.to_le_bytes()); // win:Boolean = 4-byte BOOL
+        payload.extend_from_slice(&(b'Z' as u16).to_le_bytes());
+
+        let record = es_record(TEST_PROVIDER, 10, (1, 0, 0, 0xFFFD), &payload);
+        let event = decoder.decode(&record).expect("in-band decode");
+
+        assert_eq!(event.source, SchemaSourceKind::InbandManifest);
+        assert_eq!(event.event_name, Some("AllScalars"));
+        assert_eq!(event.provider_name, Some("OneCollect-Test-InbandManifest"));
+
+        let v = values(&event);
+        assert_eq!(v.len(), 12);
+        assert_eq!(v[0], ("s8", &(-8i8).to_le_bytes()[..]));
+        assert_eq!(v[3], ("u16", &0xBEEFu16.to_le_bytes()[..]));
+        assert_eq!(v[7], ("u64", &0x0102030405060708u64.to_le_bytes()[..]));
+        assert_eq!(v[9], ("f64", &2.25f64.to_le_bytes()[..]));
+        assert_eq!(v[10], ("b", &1i32.to_le_bytes()[..]));
+        assert_eq!(v[11], ("c", &(b'Z' as u16).to_le_bytes()[..]));
+        assert_eq!(event.event_data.format().fields()[10].type_name, "u32");
+
+        let stats = decoder.inband_manifest_stats();
+        assert_eq!(stats.chunks, 3);
+        assert_eq!(stats.manifests_completed, 1);
+        assert_eq!(stats.ingest_errors(), 0);
+    }
+
+    #[test]
+    fn inband_manifest_decodes_strings_blob_and_parameterless() {
+        let mut decoder = TdhDecoder::new();
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, TEST_MANIFEST.as_bytes(), 1);
+
+        // Strings(string first, string empty, int after)
+        let mut payload = utf16z("hello-inband");
+        payload.extend(utf16z(""));
+        payload.extend_from_slice(&1234i32.to_le_bytes());
+        let record = es_record(TEST_PROVIDER, 10, (2, 0, 0, 0xFFFC), &payload);
+        let event = decoder.decode(&record).unwrap();
+        let v = values(&event);
+        let hello: Vec<u8> = "hello-inband".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(v[0], ("first", &hello[..]));
+        assert_eq!(v[1], ("empty", &[][..]));
+        assert_eq!(v[2], ("after", &1234i32.to_le_bytes()[..]));
+
+        // Blob(int before, byte[] data, int after): data is u32 len + bytes.
+        let mut payload = 7i32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&5u32.to_le_bytes());
+        payload.extend_from_slice(&[1, 2, 3, 4, 5]);
+        payload.extend_from_slice(&9i32.to_le_bytes());
+        let record = es_record(TEST_PROVIDER, 10, (4, 0, 0, 0xFFF9), &payload);
+        let event = decoder.decode(&record).unwrap();
+        assert_eq!(values(&event), vec![
+            ("before", &7i32.to_le_bytes()[..]),
+            ("data", &[1, 2, 3, 4, 5][..]),
+            ("after", &9i32.to_le_bytes()[..]),
+        ]);
+        assert_eq!(event.event_data.format().fields()[1].type_name, "binary");
+
+        // Ping(): no template, empty payload.
+        let record = es_record(TEST_PROVIDER, 10, (5, 0, 0, 0xFFF9), &[]);
+        let event = decoder.decode(&record).unwrap();
+        assert_eq!(event.event_name, Some("Ping"));
+        assert!(event.event_data.format().fields().is_empty());
+
+        // Start/Stop share a task but report their symbol names.
+        let payload = 42i32.to_le_bytes();
+        let start = es_record(TEST_PROVIDER, 10, (6, 0, 1, 1), &payload);
+        assert_eq!(decoder.decode(&start).unwrap().event_name, Some("RequestStart"));
+        let stop = es_record(TEST_PROVIDER, 10, (7, 0, 2, 1), &payload);
+        assert_eq!(decoder.decode(&stop).unwrap().event_name, Some("RequestStop"));
+    }
+
+    #[test]
+    fn tracelogging_event_from_inband_provider_takes_tl_path() {
+        let mut decoder = TdhDecoder::new();
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, TEST_MANIFEST.as_bytes(), 1);
+
+        // Same provider GUID and an Id the manifest defines, but the event
+        // carries SCHEMA_TL: it must decode via TraceLogging.
+        let schema = build_tl_schema("OneCollect-Test-InbandManifest", "MixedTl", &[("Value", TL_UINT32)]);
+        let (prov, evt) = split_tl_schema(&schema);
+        let user_data = 4242u32.to_le_bytes();
+        let mut ext_items: [EVENT_HEADER_EXTENDED_DATA_ITEM; 2] = unsafe { std::mem::zeroed() };
+        let mut record = build_test_record(prov, evt, &mut ext_items, &user_data);
+        record.EventHeader.ProviderId = unsafe { std::mem::transmute::<Guid, windows_sys::core::GUID>(TEST_PROVIDER) };
+        record.EventHeader.ProcessId = 10;
+        record.EventHeader.EventDescriptor.Id = 1;
+
+        let event = decoder.decode(&record).expect("TL decode");
+        assert_eq!(event.source, SchemaSourceKind::TraceLogging);
+        assert_eq!(event.event_name, Some("MixedTl"));
+        assert_eq!(event.provider_name, None);
+    }
+
+    #[test]
+    fn events_before_manifest_and_undefined_ids_fall_through() {
+        let mut decoder = TdhDecoder::new();
+        let payload = 1i32.to_le_bytes();
+
+        // Before any manifest: OS-registered path → NotFound.
+        let record = es_record(TEST_PROVIDER, 10, (6, 0, 1, 1), &payload);
+        assert!(matches!(decoder.decode(&record), Err(TdhDecodeError::NotFound)));
+
+        // Partial manifest only: still NotFound.
+        let half = &TEST_MANIFEST.as_bytes()[..100];
+        let chunk = build_chunk(2, 0, half);
+        let chunk_record = es_record(TEST_PROVIDER, 10, MANIFEST_DESC, &chunk);
+        assert!(matches!(decoder.decode(&chunk_record), Err(TdhDecodeError::InbandManifest)));
+        assert!(matches!(decoder.decode(&record), Err(TdhDecodeError::NotFound)));
+
+        // After the manifest: decodes; an Id it doesn't define falls through.
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, TEST_MANIFEST.as_bytes(), 2);
+        assert!(decoder.decode(&record).is_ok());
+        let undefined = es_record(TEST_PROVIDER, 10, (99, 0, 0, 0), &payload);
+        assert!(matches!(decoder.decode(&undefined), Err(TdhDecodeError::NotFound)));
+        // Version mismatch also falls through (event 8 only exists at v2).
+        let wrong_version = es_record(TEST_PROVIDER, 10, (8, 0, 0, 0), &payload);
+        assert!(matches!(decoder.decode(&wrong_version), Err(TdhDecodeError::NotFound)));
+        let right_version = es_record(TEST_PROVIDER, 10, (8, 2, 0, 0), &payload);
+        assert_eq!(decoder.decode(&right_version).unwrap().event_name, Some("Versioned"));
+    }
+
+    #[test]
+    fn malformed_chunks_are_still_reported_as_inband_manifest() {
+        let mut decoder = TdhDecoder::new();
+
+        let mut bad_magic = build_chunk(1, 0, b"<x/>");
+        bad_magic[3] = 0;
+        let record = es_record(TEST_PROVIDER, 10, MANIFEST_DESC, &bad_magic);
+        assert!(matches!(decoder.decode(&record), Err(TdhDecodeError::InbandManifest)));
+
+        let orphan = build_chunk(3, 2, b"zz");
+        let record = es_record(TEST_PROVIDER, 10, MANIFEST_DESC, &orphan);
+        assert!(matches!(decoder.decode(&record), Err(TdhDecodeError::InbandManifest)));
+
+        let bad_xml = build_chunk(1, 0, b"<events><provider");
+        let record = es_record(TEST_PROVIDER, 10, MANIFEST_DESC, &bad_xml);
+        assert!(matches!(decoder.decode(&record), Err(TdhDecodeError::InbandManifest)));
+
+        let stats = decoder.inband_manifest_stats();
+        assert_eq!(stats.chunks, 3);
+        assert_eq!(stats.envelope_errors, 1);
+        assert_eq!(stats.orphan_chunks, 1);
+        assert_eq!(stats.xml_errors, 1);
+        assert_eq!(stats.ingest_errors(), 3);
+    }
+
+    #[test]
+    fn inband_schema_ids_pointer_width_and_identical_processes() {
+        let mut decoder = TdhDecoder::new();
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, TEST_MANIFEST.as_bytes(), 1);
+        feed_manifest(&mut decoder, TEST_PROVIDER, 20, TEST_MANIFEST.as_bytes(), 2);
+
+        // Misc(Guid, DateTime, IntPtr, enum)
+        let payload_64 = [0u8; 16 + 8 + 8 + 4];
+        let payload_32 = [0u8; 16 + 8 + 4 + 4];
+
+        let r64 = es_record(TEST_PROVIDER, 10, (3, 0, 0, 0), &payload_64);
+        let (id_64, ptr_64) = {
+            let e = decoder.decode(&r64).unwrap();
+            (e.schema_id, e.event_data.format().fields()[2].size)
+        };
+
+        let mut r32 = es_record(TEST_PROVIDER, 10, (3, 0, 0, 0), &payload_32);
+        r32.EventHeader.Flags |= EVENT_HEADER_FLAG_32_BIT_HEADER;
+        let (id_32, ptr_32) = {
+            let e = decoder.decode(&r32).unwrap();
+            (e.schema_id, e.event_data.format().fields()[2].size)
+        };
+
+        assert_ne!(id_64, id_32);
+        assert_eq!((ptr_64, ptr_32), (8, 4));
+
+        // A different process with an identical manifest shares the schema.
+        let other = es_record(TEST_PROVIDER, 20, (3, 0, 0, 0), &payload_64);
+        assert_eq!(decoder.decode(&other).unwrap().schema_id, id_64);
+        // Identical re-send keeps SchemaIds stable.
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, TEST_MANIFEST.as_bytes(), 1);
+        assert_eq!(decoder.decode(&r64).unwrap().schema_id, id_64);
+    }
+
+    #[test]
+    fn rebinding_purges_cached_schemas_and_reuses_slots() {
+        let manifest = |ty: &str| format!(r#"<events><provider name="P" guid="{{369e340b-d54c-5d95-1211-b7a318f16882}}">
+<events><event value="1" symbol="E" template="T"/></events>
+<templates><template tid="T"><data name="v" inType="{ty}"/></template></templates>
+</provider></events>"#);
+
+        let mut decoder = TdhDecoder::new();
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, manifest("win:UInt32").as_bytes(), 1);
+
+        let payload = 5u64.to_le_bytes();
+        let record = es_record(TEST_PROVIDER, 10, (1, 0, 0, 0), &payload);
+        let first_id = {
+            let e = decoder.decode(&record).unwrap();
+            assert_eq!(e.event_data.format().fields()[0].size, 4);
+            e.schema_id
+        };
+        let slots = decoder.cache.schemas.len();
+
+        // The same process re-emits a different manifest (new build).
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, manifest("win:UInt64").as_bytes(), 1);
+        assert!(decoder.cache.inband_64.is_empty(), "old schemas purged");
+        assert_eq!(decoder.cache.free.len(), 1);
+
+        let e = decoder.decode(&record).unwrap();
+        assert_eq!(e.event_data.format().fields()[0].size, 8, "new layout used");
+        assert_ne!(e.schema_id, first_id, "SchemaIds are never reused");
+        assert_eq!(decoder.cache.schemas.len(), slots, "freed slot was recycled");
+    }
+
+    #[test]
+    fn unbound_process_uses_agreed_manifest_only_after_os_lookup_misses() {
+        let mut decoder = TdhDecoder::new();
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, TEST_MANIFEST.as_bytes(), 1);
+
+        let payload = 42i32.to_le_bytes();
+        let os_key = ManifestEventKey { provider: TEST_PROVIDER, id: 6, version: 0 };
+
+        // PID 30 sent no manifest.  The OS lookup runs first (NotFound for
+        // this unregistered provider), then the agreed manifest is used.
+        let unbound = es_record(TEST_PROVIDER, 30, (6, 0, 1, 1), &payload);
+        assert!(!decoder.os_manifest_absent.contains(&os_key));
+        let first = {
+            let e = decoder.decode(&unbound).expect("fallback decode");
+            assert_eq!(e.source, SchemaSourceKind::InbandManifest);
+            assert_eq!(e.event_name, Some("RequestStart"));
+            e.schema_id
+        };
+        assert!(decoder.os_manifest_absent.contains(&os_key), "OS miss memoized");
+
+        // Later events skip the OS lookup and share the bound process's schema.
+        assert_eq!(decoder.decode(&unbound).unwrap().schema_id, first);
+        let bound = es_record(TEST_PROVIDER, 10, (6, 0, 1, 1), &payload);
+        assert_eq!(decoder.decode(&bound).unwrap().schema_id, first);
+    }
+
+    #[test]
+    fn conflicting_manifests_are_not_guessed_for_unbound_process() {
+        let manifest = |ty: &str| format!(r#"<events><provider name="P" guid="{{369e340b-d54c-5d95-1211-b7a318f16882}}">
+<events><event value="1" symbol="E" template="T"/></events>
+<templates><template tid="T"><data name="v" inType="{ty}"/></template></templates>
+</provider></events>"#);
+
+        let mut decoder = TdhDecoder::new();
+        feed_manifest(&mut decoder, TEST_PROVIDER, 10, manifest("win:UInt32").as_bytes(), 1);
+        feed_manifest(&mut decoder, TEST_PROVIDER, 20, manifest("win:UInt64").as_bytes(), 1);
+
+        let payload = 5u64.to_le_bytes();
+        let p10 = es_record(TEST_PROVIDER, 10, (1, 0, 0, 0), &payload);
+        let p20 = es_record(TEST_PROVIDER, 20, (1, 0, 0, 0), &payload);
+        let p30 = es_record(TEST_PROVIDER, 30, (1, 0, 0, 0), &payload);
+
+        assert_eq!(decoder.decode(&p10).unwrap().event_data.format().fields()[0].size, 4);
+        assert_eq!(decoder.decode(&p20).unwrap().event_data.format().fields()[0].size, 8);
+        assert!(matches!(decoder.decode(&p30), Err(TdhDecodeError::NotFound)));
     }
 }

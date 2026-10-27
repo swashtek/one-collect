@@ -18,6 +18,7 @@ categories = [
 exclude = [
     "UnitTest.pprof",
     "test_assets/stack_gen/**",
+    "test_assets/eventsource/EsFixture/**",
 ]
 
 [features]
@@ -35,6 +36,10 @@ sha1 = "0.10.6"
 tracing = "0.1"
 cpp_demangle = "0.4.3"
 rustc-demangle = "0.1"
+# Parses .NET EventSource in-band manifests in the ETW TDH decoder
+# (`etw/eventsource`). Not gated to Windows for the same reason as
+# windows-sys below: `etw` is also compiled under `cfg(doc)` on every target.
+quick-xml = "0.41"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.55.0"

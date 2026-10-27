@@ -17,6 +17,12 @@
 //! asserts that they decode through `TdhGetEventInformation` into a real
 //! `EventFormat` with a Task-derived event name.
 //!
+//! The EventSource tests at the end of the file exercise the in-band
+//! manifest path: `tdh_decodes_eventsource_inband_manifest` emulates the
+//! EventSource manifest-chunk protocol via `EventRegister`/`EventWrite`, and
+//! the opt-in `tdh_decodes_live_dotnet_eventsource` drives a real .NET
+//! EventSource process (see `test_assets/eventsource/README.md`).
+//!
 //! All tests are marked `#[ignore]` because the consumer side of ETW
 //! requires administrative privileges (`SeSystemProfilePrivilege` /
 //! `SeDebugPrivilege`).  Run manually from an elevated shell with:
@@ -41,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use one_collect::{Guid, Writable};
 use one_collect::etw::{EtwSession, LEVEL_VERBOSE};
-use one_collect::etw::tdh::TdhDecoder;
+use one_collect::etw::tdh::{SchemaSourceKind, TdhDecodeError, TdhDecoder};
 use one_collect::event::Event;
 use one_collect::event::os::windows::WindowsEventExtension;
 
@@ -168,6 +174,8 @@ struct CapturedEvent {
     field_types: Vec<String>,
     payload: Vec<u8>,
     format: one_collect::event::EventFormat,
+    source: SchemaSourceKind,
+    provider_name: Option<String>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -251,6 +259,8 @@ where
         // still visible in `--nocapture` output for debugging.
         match decoder.decode(record) {
             Ok(decoded) => on_decoded(&decoded),
+            // EventSource manifest chunks are schema metadata, not failures.
+            Err(TdhDecodeError::InbandManifest) => {}
             Err(e) => eprintln!("WARN: TDH decode failed for a record: {e:?}"),
         }
 
@@ -301,6 +311,8 @@ fn make_capture_sink() -> (
             field_types,
             payload,
             format: format_clone,
+            source: decoded.source,
+            provider_name: decoded.provider_name.map(str::to_string),
         });
         counter_for_cb.fetch_add(1, Ordering::Relaxed);
     };
@@ -1712,5 +1724,404 @@ fn tdh_decodes_compiled_manifest_all_types() {
     assert_eq!(ev.name, "Blobs", "blobs task name");
     assert_schema(ev, &BLOB_NAMES, &BLOB_TYPES, "manifest blob");
     assert_eq!(field_bytes(ev, "Blob"), EXP_BLOB);
+}
+
+// ── Test G: EventSource in-band manifests ────────────────────────────
+//
+// .NET `EventSource` providers in manifest mode emit their manifest in-band
+// as chunked `0xFFFE/0xFE/0xFFFE` events.  `tdh_decodes_eventsource_inband_manifest`
+// emulates that protocol through `EventRegister`/`EventWrite` (no .NET
+// dependency, so it runs in CI) using the real EventSource-generated
+// manifest in `test_assets/eventsource/`, split into several chunks.  It
+// also writes a TraceLogging event under the *same* provider GUID, the
+// mixed-mode case an EventSource can produce.
+//
+// `tdh_decodes_live_dotnet_eventsource` drives a real .NET EventSource
+// process.  It is opt-in: set `ONE_COLLECT_ES_FIXTURE` to the path of an
+// executable that runs the fixture `TestSource` (see
+// `test_assets/eventsource/README.md`) and accepts `emit <seconds>`.
+
+/// Name of the fixture EventSource; its GUID is the EventSource name hash.
+const ES_PROVIDER_NAME: &str = "OneCollect-Test-InbandManifest";
+
+/// The real `EventSource.GenerateManifest` output for the fixture source.
+const ES_MANIFEST: &str = include_str!("../test_assets/eventsource/one_collect_test_eventsource.xml");
+
+/// Expected fixture values (shared by the emulated and live tests; the
+/// live fixture writes exactly these).
+const ES_S8: i8 = -8;
+const ES_U8: u8 = 0xAB;
+const ES_S16: i16 = -1600;
+const ES_U16: u16 = 0xBEEF;
+const ES_S32: i32 = -32_000_000;
+const ES_U32: u32 = 0xDEAD_BEEF;
+const ES_S64: i64 = -6_400_000_000_000;
+const ES_U64: u64 = 0x0102_0304_0506_0708;
+const ES_F32: f32 = 3.5;
+const ES_F64: f64 = 2.25;
+const ES_CHAR: u16 = b'Z' as u16;
+const ES_STR: &str = "hello-inband";
+const ES_AFTER: i32 = 1234;
+/// `12345678-9abc-def0-1122-334455667788` in on-wire (COM) layout.
+const ES_GUID_BYTES: [u8; 16] = [
+    0x78, 0x56, 0x34, 0x12, 0xBC, 0x9A, 0xF0, 0xDE,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+];
+/// FILETIME of 2021-07-01T12:34:56Z.
+const ES_FILETIME: i64 = 1_625_142_896 * 10_000_000 + 116_444_736_000_000_000;
+const ES_PTR: u64 = 0x1234;
+const ES_COLOR: u32 = 1;
+const ES_BLOB: [u8; 5] = [1, 2, 3, 4, 5];
+const ES_REQUEST: i32 = 42;
+const ES_VERSIONED: i32 = 77;
+const ES_MIXED_TL: i32 = 4242;
+
+/// EventSource's manifest event descriptor: Id 0xFFFE, Version 1,
+/// Level LogAlways, Opcode 0xFE, Task 0xFFFE, all non-channel keywords.
+const ES_MANIFEST_DESCRIPTOR: EVENT_DESCRIPTOR = EVENT_DESCRIPTOR {
+    Id: 0xFFFE,
+    Version: 1,
+    Channel: 0,
+    Level: 0,
+    Opcode: 0xFE,
+    Task: 0xFFFE,
+    Keyword: 0x00FF_FFFF_FFFF_FFFF,
+};
+
+/// Emits EventSource-protocol events through a raw ETW registration.
+struct EventSourceEmulator {
+    handle: u64,
+}
+
+impl EventSourceEmulator {
+    fn register(guid: Guid) -> Result<Self, u32> {
+        // SAFETY: `Guid` and `windows_sys::core::GUID` are both `repr(C)`
+        // with identical layout.
+        let guid_sys: windows_sys::core::GUID = unsafe { std::mem::transmute(guid) };
+        let mut handle: u64 = 0;
+        // SAFETY: `guid_sys` outlives the call; no enable callback.
+        let status = unsafe {
+            EventRegister(&guid_sys, None, std::ptr::null(), &mut handle)
+        };
+        if status == 0 { Ok(Self { handle }) } else { Err(status) }
+    }
+
+    fn write(&self, desc: &EVENT_DESCRIPTOR, payload: &[u8]) -> u32 {
+        let data = EVENT_DATA_DESCRIPTOR {
+            Ptr: payload.as_ptr() as u64,
+            Size: payload.len() as u32,
+            // SAFETY: the reserved union must be zero-initialised.
+            Anonymous: unsafe { std::mem::zeroed() },
+        };
+        // SAFETY: live registration; `desc`, `data` and `payload` outlive
+        // the call.
+        unsafe { EventWrite(self.handle as i64, desc, 1, &data) }
+    }
+
+    /// Writes `manifest` as EventSource manifest chunks of at most
+    /// `chunk_size` bytes, exactly as `EventSource.SendManifest` does.
+    fn write_manifest(&self, manifest: &[u8], chunk_size: usize) -> u32 {
+        let total = manifest.len().div_ceil(chunk_size) as u16;
+        for (n, chunk) in manifest.chunks(chunk_size).enumerate() {
+            // ManifestEnvelope: Format=1, Major=1, Minor=0, Magic=0x5B,
+            // TotalChunks, ChunkNumber (little-endian u16s).
+            let mut payload = vec![1u8, 1, 0, 0x5B];
+            payload.extend_from_slice(&total.to_le_bytes());
+            payload.extend_from_slice(&(n as u16).to_le_bytes());
+            payload.extend_from_slice(chunk);
+            let status = self.write(&ES_MANIFEST_DESCRIPTOR, &payload);
+            if status != 0 {
+                return status;
+            }
+        }
+        0
+    }
+
+    fn write_event(&self, id: u16, version: u8, opcode: u8, task: u16, payload: &[u8]) -> u32 {
+        let desc = EVENT_DESCRIPTOR {
+            Id: id,
+            Version: version,
+            Channel: 0,
+            Level: 4, // win:Informational
+            Opcode: opcode,
+            Task: task,
+            Keyword: 0xF000_0000_0000, // EventSource session keyword bits
+        };
+        self.write(&desc, payload)
+    }
+}
+
+impl Drop for EventSourceEmulator {
+    fn drop(&mut self) {
+        // SAFETY: `handle` came from a successful `EventRegister`.
+        unsafe {
+            EventUnregister(self.handle as i64);
+        }
+    }
+}
+
+fn es_all_scalars_payload() -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&ES_S8.to_le_bytes());
+    p.extend_from_slice(&ES_U8.to_le_bytes());
+    p.extend_from_slice(&ES_S16.to_le_bytes());
+    p.extend_from_slice(&ES_U16.to_le_bytes());
+    p.extend_from_slice(&ES_S32.to_le_bytes());
+    p.extend_from_slice(&ES_U32.to_le_bytes());
+    p.extend_from_slice(&ES_S64.to_le_bytes());
+    p.extend_from_slice(&ES_U64.to_le_bytes());
+    p.extend_from_slice(&ES_F32.to_le_bytes());
+    p.extend_from_slice(&ES_F64.to_le_bytes());
+    p.extend_from_slice(&1i32.to_le_bytes()); // win:Boolean (BOOL)
+    p.extend_from_slice(&ES_CHAR.to_le_bytes());
+    p
+}
+
+fn es_utf16z(s: &str) -> Vec<u8> {
+    let mut out: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+fn es_blob_payload() -> Vec<u8> {
+    let mut p = 7i32.to_le_bytes().to_vec();
+    p.extend_from_slice(&(ES_BLOB.len() as u32).to_le_bytes());
+    p.extend_from_slice(&ES_BLOB);
+    p.extend_from_slice(&9i32.to_le_bytes());
+    p
+}
+
+/// Builds a session capturing the fixture provider, stopping once every
+/// name in `expected` has been decoded.
+fn es_session(
+    wide_name: &str,
+    expected: &'static [&'static str],
+) -> (EtwSession, Writable<Vec<CapturedEvent>>, Arc<AtomicBool>) {
+    let (captured, _counter, mut sink) = make_capture_sink();
+    let seen: Rc<RefCell<std::collections::HashSet<String>>> = Default::default();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_cb = done.clone();
+
+    let session = build_capturing_session(
+        one_collect::guid_from_provider_name(ES_PROVIDER_NAME),
+        wide_name,
+        move |decoded| {
+            sink(decoded);
+            if let Some(name) = decoded.event_name {
+                seen.borrow_mut().insert(name.to_string());
+            }
+            if expected.iter().all(|n| seen.borrow().contains(*n)) {
+                done_cb.store(true, Ordering::Relaxed);
+            }
+        },
+    );
+
+    (session, captured, done)
+}
+
+/// Asserts an in-band event decoded from the manifest, with its provider
+/// name, and returns it.
+fn es_find<'a>(captured: &'a [CapturedEvent], name: &str) -> &'a CapturedEvent {
+    let ev = find_event(captured, name);
+    assert_eq!(ev.source, SchemaSourceKind::InbandManifest, "{name} schema source");
+    assert_eq!(ev.provider_name.as_deref(), Some(ES_PROVIDER_NAME), "{name} provider name");
+    ev
+}
+
+fn assert_es_all_scalars(captured: &[CapturedEvent]) {
+    let ev = es_find(captured, "AllScalars");
+    assert_schema(
+        ev,
+        &["s8", "u8", "s16", "u16", "s32", "u32", "s64", "u64", "f32", "f64", "b", "c"],
+        &["s8", "u8", "s16", "u16", "s32", "u32", "s64", "u64", "float", "double", "u32", "u16"],
+        "EventSource AllScalars",
+    );
+    assert_eq!(i8::from_le_bytes(exact::<1>(ev, "s8")), ES_S8);
+    assert_eq!(u8::from_le_bytes(exact::<1>(ev, "u8")), ES_U8);
+    assert_eq!(i16::from_le_bytes(exact::<2>(ev, "s16")), ES_S16);
+    assert_eq!(u16::from_le_bytes(exact::<2>(ev, "u16")), ES_U16);
+    assert_eq!(i32::from_le_bytes(exact::<4>(ev, "s32")), ES_S32);
+    assert_eq!(u32::from_le_bytes(exact::<4>(ev, "u32")), ES_U32);
+    assert_eq!(i64::from_le_bytes(exact::<8>(ev, "s64")), ES_S64);
+    assert_eq!(u64::from_le_bytes(exact::<8>(ev, "u64")), ES_U64);
+    assert_eq!(f32::from_le_bytes(exact::<4>(ev, "f32")), ES_F32);
+    assert_eq!(f64::from_le_bytes(exact::<8>(ev, "f64")), ES_F64);
+    assert_eq!(i32::from_le_bytes(exact::<4>(ev, "b")), 1);
+    assert_eq!(u16::from_le_bytes(exact::<2>(ev, "c")), ES_CHAR);
+}
+
+fn assert_es_blob(captured: &[CapturedEvent]) {
+    let ev = es_find(captured, "Blob");
+    assert_schema(ev, &["before", "data", "after"], &["s32", "binary", "s32"], "EventSource Blob");
+    assert_eq!(i32::from_le_bytes(exact::<4>(ev, "before")), 7);
+    assert_eq!(field_bytes(ev, "data"), ES_BLOB);
+    // Proves the u32 length prefix was consumed and the next offset kept.
+    assert_eq!(i32::from_le_bytes(exact::<4>(ev, "after")), 9);
+}
+
+fn assert_es_request(captured: &[CapturedEvent], name: &str) {
+    let ev = es_find(captured, name);
+    assert_schema(ev, &["requestId"], &["s32"], name);
+    assert_eq!(i32::from_le_bytes(exact::<4>(ev, "requestId")), ES_REQUEST);
+}
+
+fn es_strings_payload() -> Vec<u8> {
+    let mut p = es_utf16z(ES_STR);
+    p.extend(es_utf16z(""));
+    p.extend_from_slice(&ES_AFTER.to_le_bytes());
+    p
+}
+
+fn assert_es_strings(captured: &[CapturedEvent]) {
+    let ev = es_find(captured, "Strings");
+    assert_schema(ev, &["first", "empty", "after"], &["wstring", "wstring", "s32"], "EventSource Strings");
+    let s: Vec<u16> = field_bytes(ev, "first")
+        .chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    assert_eq!(String::from_utf16(&s).unwrap(), ES_STR);
+    assert!(field_bytes(ev, "empty").is_empty());
+    assert_eq!(i32::from_le_bytes(exact::<4>(ev, "after")), ES_AFTER);
+}
+
+/// Asserts the mixed-mode TraceLogging event (same provider GUID as the
+/// manifest) took the TraceLogging path.
+fn assert_es_mixed_tl(captured: &[CapturedEvent]) {
+    let ev = find_event(captured, "MixedTl");
+    assert_eq!(ev.source, SchemaSourceKind::TraceLogging, "MixedTl schema source");
+    assert_eq!(i32::from_le_bytes(exact::<4>(ev, "Value")), ES_MIXED_TL);
+}
+
+#[ignore]
+#[test]
+fn tdh_decodes_eventsource_inband_manifest() {
+    const EXPECTED: &[&str] = &["AllScalars", "Strings", "Blob", "Ping", "RequestStart", "MixedTl"];
+    let provider_guid = one_collect::guid_from_provider_name(ES_PROVIDER_NAME);
+
+    // TraceLogging registration under the same name => same GUID.
+    assert_eq!(
+        tlg_guid_to_oc(tld::Provider::guid_from_name(ES_PROVIDER_NAME)).to_bytes(),
+        provider_guid.to_bytes()
+    );
+    let tl_provider: &'static tld::Provider = Box::leak(Box::new(
+        tld::Provider::new(ES_PROVIDER_NAME, &tld::Provider::options()),
+    ));
+    unsafe {
+        Pin::new_unchecked(tl_provider).register();
+    }
+
+    let (mut session, captured, done) = es_session("OneCollect.TdhIntegration.EventSource", EXPECTED);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    session.add_started_callback(move |_ctx| {
+        let stop = stop_thread.clone();
+        std::thread::spawn(move || {
+            let emulator = match EventSourceEmulator::register(provider_guid) {
+                Ok(e) => e,
+                Err(code) => {
+                    eprintln!("WARN: EventRegister failed with {code}");
+                    return;
+                }
+            };
+            let scalars = es_all_scalars_payload();
+            let strings = es_strings_payload();
+            let blob = es_blob_payload();
+            let request = ES_REQUEST.to_le_bytes();
+            let mut builder = tld::EventBuilder::new();
+            let mut warned = false;
+            let deadline = Instant::now() + TEST_TIMEOUT;
+
+            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                // Like EventSource on enable: manifest first (in several
+                // 1 KiB chunks), then payload events.
+                let mut status = emulator.write_manifest(ES_MANIFEST.as_bytes(), 1024);
+                for (id, opcode, task, payload) in [
+                    (1u16, 0u8, 0xFFFDu16, &scalars[..]),
+                    (2, 0, 0xFFFC, &strings[..]),
+                    (4, 0, 0xFFFA, &blob[..]),
+                    (5, 0, 0xFFF9, &[][..]),
+                    (6, 1, 1, &request[..]),
+                ] {
+                    status = status.max(emulator.write_event(id, 0, opcode, task, payload));
+                }
+                if status != 0 && !warned {
+                    eprintln!("WARN: EventWrite failed with {status}");
+                    warned = true;
+                }
+
+                builder
+                    .reset("MixedTl", tlg::Level::Informational, TEST_KEYWORD, 0)
+                    .add_i32("Value", ES_MIXED_TL, tlg::OutType::Default, 0)
+                    .write(tl_provider, None, None);
+
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    });
+
+    let captured = drive_until(session, "one_collect_tdh_eventsource", &captured, move || {
+        done.load(Ordering::Relaxed)
+    });
+    stop.store(true, Ordering::Relaxed);
+
+    assert_es_all_scalars(&captured);
+    assert_es_strings(&captured);
+    assert_es_blob(&captured);
+    let ping = es_find(&captured, "Ping");
+    assert!(ping.field_names.is_empty(), "Ping has no fields");
+    assert_es_request(&captured, "RequestStart");
+    assert_es_mixed_tl(&captured);
+}
+
+#[ignore]
+#[test]
+fn tdh_decodes_live_dotnet_eventsource() {
+    const EXPECTED: &[&str] = &[
+        "AllScalars", "Strings", "Misc", "Blob", "Ping",
+        "RequestStart", "RequestStop", "Versioned", "MixedTl",
+    ];
+
+    let Ok(fixture) = std::env::var("ONE_COLLECT_ES_FIXTURE") else {
+        eprintln!("SKIP tdh_decodes_live_dotnet_eventsource: ONE_COLLECT_ES_FIXTURE is not set");
+        return;
+    };
+
+    let (mut session, captured, done) = es_session("OneCollect.TdhIntegration.DotNet", EXPECTED);
+
+    let child: Arc<std::sync::Mutex<Option<std::process::Child>>> = Default::default();
+    let child_cb = child.clone();
+    session.add_started_callback(move |_ctx| {
+        // Started after the session enabled the provider, so the
+        // EventSource sends its manifest as soon as it is constructed.
+        match Command::new(&fixture).args(["emit", "25"]).spawn() {
+            Ok(c) => *child_cb.lock().unwrap() = Some(c),
+            Err(e) => eprintln!("WARN: failed to start {fixture}: {e}"),
+        }
+    });
+
+    let captured = drive_until(session, "one_collect_tdh_dotnet", &captured, move || {
+        done.load(Ordering::Relaxed)
+    });
+    if let Some(mut c) = child.lock().unwrap().take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    assert_es_all_scalars(&captured);
+    assert_es_strings(&captured);
+    assert_es_blob(&captured);
+    assert_es_request(&captured, "RequestStart");
+    assert_es_request(&captured, "RequestStop");
+
+    let ev = es_find(&captured, "Misc");
+    assert_eq!(field_bytes(ev, "g"), ES_GUID_BYTES);
+    assert_eq!(i64::from_le_bytes(exact::<8>(ev, "when")), ES_FILETIME);
+    assert_eq!(u64::from_le_bytes(exact::<8>(ev, "ptr")), ES_PTR);
+    assert_eq!(u32::from_le_bytes(exact::<4>(ev, "color")), ES_COLOR);
+
+    let ev = es_find(&captured, "Versioned");
+    assert_eq!(i32::from_le_bytes(exact::<4>(ev, "value")), ES_VERSIONED);
+
+    assert!(es_find(&captured, "Ping").field_names.is_empty());
+    assert_es_mixed_tl(&captured);
 }
 

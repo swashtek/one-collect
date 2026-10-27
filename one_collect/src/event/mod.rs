@@ -353,6 +353,26 @@ pub enum LocationType {
     StaticLenPrefixArray,
     /// Represents a static location that holds a UTF16 string.
     StaticUTF16String,
+    /// Represents a static location that holds a byte array prefixed by a
+    /// little-endian `u32` byte count (e.g. .NET `EventSource` `byte[]`
+    /// arguments). The field's `size` is always `0`; the returned data
+    /// excludes the 4-byte prefix.
+    StaticLenPrefix32Array,
+}
+
+/// Reads the `u32` length prefix of a `StaticLenPrefix32Array` field at the
+/// start of `slice` and returns the total bytes it occupies (prefix + data),
+/// or `None` if the prefix or data would run past the end of `slice`.
+fn len_prefix32_extent(slice: &[u8]) -> Option<usize> {
+    let prefix: [u8; 4] = slice.get(0..4)?.try_into().ok()?;
+    let len = usize::try_from(u32::from_le_bytes(prefix)).ok()?;
+    let extent = len.checked_add(4)?;
+
+    if extent > slice.len() {
+        return None;
+    }
+
+    Some(extent)
 }
 
 /// `EventField` represents a field in an event.
@@ -588,6 +608,19 @@ impl EventFormat {
                 &slice[2..2+bytes]
             },
 
+            LocationType::StaticLenPrefix32Array => {
+                if offset > data.len() {
+                    return EMPTY;
+                }
+
+                let slice = &data[offset..];
+
+                match len_prefix32_extent(slice) {
+                    Some(extent) => &slice[4..extent],
+                    None => EMPTY,
+                }
+            },
+
             LocationType::DynRelative |
             LocationType::DynAbsolute => {
                 /* Only produced by Linux ftrace sources (kernel tracepoints
@@ -685,6 +718,13 @@ impl EventFormat {
 
                     skip_offset += 2;
                     skip_offset += element_size * len;
+                },
+
+                LocationType::StaticLenPrefix32Array => {
+                    match len_prefix32_extent(&data[start..]) {
+                        Some(extent) => skip_offset += extent,
+                        None => return EMPTY,
+                    }
                 },
 
                 _ => {
@@ -1301,6 +1341,15 @@ impl EventFormat {
                         });
                     },
 
+                    LocationType::StaticLenPrefix32Array => {
+                        /* Byte array: the u32 prefix is the byte count */
+                        skips.push(FieldSkip {
+                            loc_type: field.location,
+                            size: Some(1),
+                            offset,
+                        });
+                    },
+
                     _ => {
                         /* Cannot read field data via closure */
                         return None;
@@ -1792,6 +1841,13 @@ impl<'a> FieldsWithData<'a> {
                 self.skip_offset += element_size * len;
             },
 
+            LocationType::StaticLenPrefix32Array => {
+                match len_prefix32_extent(&self.data[start..]) {
+                    Some(extent) => self.skip_offset += extent,
+                    None => self.broken = true,
+                }
+            },
+
             _ => { },
         }
     }
@@ -1844,7 +1900,8 @@ impl<'a> Iterator for FieldsWithData<'a> {
             match location {
                 LocationType::StaticString |
                 LocationType::StaticUTF16String |
-                LocationType::StaticLenPrefixArray => {
+                LocationType::StaticLenPrefixArray |
+                LocationType::StaticLenPrefix32Array => {
                     self.advance_variable(field);
                     self.seen_variable = true;
                 },
@@ -3126,6 +3183,135 @@ mod tests {
 
         let range = format.get_rel_loc(rel_data, &data).unwrap();
         assert_eq!(data[8..12], data[range]);
+    }
+
+    // ── StaticLenPrefix32Array (u32-prefixed byte array) tests ──
+
+    fn blob32_format() -> EventFormat {
+        // u32 + blob32 + u32: the EventSource `byte[]` layout.
+        let mut format = EventFormat::new();
+        format.add_field(EventField::new(
+            "Before".into(), "s32".into(), LocationType::Static, 0, 4));
+        format.add_field(EventField::new(
+            "Data".into(), "binary".into(),
+            LocationType::StaticLenPrefix32Array, 4, 0));
+        format.add_field(EventField::new(
+            "After".into(), "s32".into(), LocationType::Static, 0, 4));
+        format
+    }
+
+    fn blob32_payload(blob: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&7i32.to_le_bytes());
+        data.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        data.extend_from_slice(blob);
+        data.extend_from_slice(&9i32.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn blob32_closures_resolve_data_and_following_field() {
+        let format = blob32_format();
+        let data = blob32_payload(&[1, 2, 3, 4, 5]);
+
+        let mut before = format.try_get_field_data_closure("Before").unwrap();
+        let mut blob = format.try_get_field_data_closure("Data").unwrap();
+        let mut after = format.try_get_field_data_closure("After").unwrap();
+
+        assert_eq!(before(&data), &7i32.to_le_bytes());
+        assert_eq!(blob(&data), &[1, 2, 3, 4, 5]);
+        assert_eq!(after(&data), &9i32.to_le_bytes());
+    }
+
+    #[test]
+    fn blob32_fields_with_data_matches_closures() {
+        let format = blob32_format();
+
+        for blob in [&[][..], &[0xAA][..], &[1, 2, 3, 4, 5, 6, 7, 8, 9][..]] {
+            let data = blob32_payload(blob);
+            let got: Vec<&[u8]> = format.fields_with_data(&data)
+                .map(|(_, bytes)| bytes)
+                .collect();
+
+            assert_eq!(got.len(), 3);
+            assert_eq!(got[0], &7i32.to_le_bytes());
+            assert_eq!(got[1], blob);
+            assert_eq!(got[2], &9i32.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn blob32_length_past_end_is_empty_and_breaks_following() {
+        let format = blob32_format();
+
+        // Length claims far more bytes than present (including a value that
+        // would overflow `4 + len` on 32-bit hosts).
+        for claimed in [100u32, u32::MAX] {
+            let mut data = Vec::new();
+            data.extend_from_slice(&7i32.to_le_bytes());
+            data.extend_from_slice(&claimed.to_le_bytes());
+            data.extend_from_slice(&[1, 2, 3]);
+
+            let mut blob = format.try_get_field_data_closure("Data").unwrap();
+            let mut after = format.try_get_field_data_closure("After").unwrap();
+            assert_eq!(blob(&data), EMPTY);
+            assert_eq!(after(&data), EMPTY);
+
+            let got: Vec<&[u8]> = format.fields_with_data(&data)
+                .map(|(_, bytes)| bytes)
+                .collect();
+            assert_eq!(got, vec![&7i32.to_le_bytes()[..], EMPTY, EMPTY]);
+        }
+    }
+
+    #[test]
+    fn blob32_truncated_prefix_is_empty() {
+        let format = blob32_format();
+
+        // Only 2 of the 4 prefix bytes are present.
+        let mut data = Vec::new();
+        data.extend_from_slice(&7i32.to_le_bytes());
+        data.extend_from_slice(&[5, 0]);
+
+        let mut blob = format.try_get_field_data_closure("Data").unwrap();
+        let mut after = format.try_get_field_data_closure("After").unwrap();
+        assert_eq!(blob(&data), EMPTY);
+        assert_eq!(after(&data), EMPTY);
+
+        let got: Vec<&[u8]> = format.fields_with_data(&data)
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(got, vec![&7i32.to_le_bytes()[..], EMPTY, EMPTY]);
+    }
+
+    #[test]
+    fn blob32_mixed_with_other_variable_fields() {
+        // blob32 + counted_string + blob32 + u16 exercises both skip kinds.
+        let mut format = EventFormat::new();
+        format.add_field(EventField::new(
+            "A".into(), "binary".into(), LocationType::StaticLenPrefix32Array, 0, 0));
+        format.add_field(EventField::new(
+            "S".into(), "counted_string".into(), LocationType::StaticLenPrefixArray, 0, 0));
+        format.add_field(EventField::new(
+            "B".into(), "binary".into(), LocationType::StaticLenPrefix32Array, 0, 0));
+        format.add_field(EventField::new(
+            "Tail".into(), "u16".into(), LocationType::Static, 0, 2));
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&[0xA1, 0xA2]);
+        data.extend_from_slice(&3u16.to_ne_bytes());
+        data.extend_from_slice(b"xyz");
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0xBEEFu16.to_le_bytes());
+
+        let mut tail = format.try_get_field_data_closure("Tail").unwrap();
+        assert_eq!(tail(&data), &0xBEEFu16.to_le_bytes());
+
+        let got: Vec<&[u8]> = format.fields_with_data(&data)
+            .map(|(_, bytes)| bytes)
+            .collect();
+        assert_eq!(got, vec![&[0xA1, 0xA2][..], b"xyz", EMPTY, &0xBEEFu16.to_le_bytes()]);
     }
 
     // ── StaticLenPrefixArray (counted string) tests ─────────────

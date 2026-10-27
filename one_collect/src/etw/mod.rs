@@ -15,6 +15,7 @@ use crate::Guid;
 #[allow(dead_code)]
 mod abi;
 mod events;
+mod eventsource;
 mod providers;
 pub mod tdh;
 
