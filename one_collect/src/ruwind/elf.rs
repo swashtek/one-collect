@@ -1302,9 +1302,12 @@ mod go {
 
 #[cfg(test)]
 use go::{go_elf_section_count_allowed, GO_ELF_SECTION_LIMIT};
-pub(crate) use go::{
-    has_go_build_info, has_go_pclntab, read_go_pclntab, recover_go_pclntab,
-};
+pub(crate) use go::{read_go_pclntab, recover_go_pclntab};
+// Only the Linux exporter (also compiled for rustdoc) and tests probe for Go binaries.
+#[cfg(any(doc, test, target_os = "linux"))]
+pub(crate) use go::has_go_build_info;
+#[cfg(any(doc, target_os = "linux"))]
+pub(crate) use go::has_go_pclntab;
 #[cfg(test)]
 pub(crate) use go::recover_go_pclntab_with_chunk;
 

@@ -785,17 +785,44 @@ impl TraceEnable {
         &self,
         handle: u64,
         target_pids: &Option<Vec<i32>>) -> anyhow::Result<()> {
+        self.enable_with(target_pids, |params| unsafe {
+            EnableTraceEx2(
+                handle,
+                &self.provider,
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                self.level,
+                self.keyword,
+                0,
+                0,
+                params)
+        })
+    }
+
+    fn enable_with(
+        &self,
+        target_pids: &Option<Vec<i32>>,
+        enable_trace: impl FnOnce(&ENABLE_TRACE_PARAMETERS) -> u32) -> anyhow::Result<()> {
         let mut params = ENABLE_TRACE_PARAMETERS::default();
+
+        /*
+         * params only holds raw pointers to the filter descriptors, and the
+         * descriptors only hold raw pointers to their filter data. Declare all
+         * of it at function scope so it stays alive until enable_trace returns.
+         */
+        let events_filter;
+        let callstacks_filter;
+        let callstack_kw_filter;
+        let mut filters = Vec::new();
 
         if !self.no_filtering {
             let mut events = EVENT_FILTER_DESCRIPTOR::default();
-            let events_filter = Self::build_event_filter(&self.events);
+            events_filter = Self::build_event_filter(&self.events);
             events.Type = EVENT_FILTER_TYPE_EVENT_ID;
             events.Filter = events_filter.as_ptr();
             events.Size = events_filter.len() as u32;
 
             let mut callstacks = EVENT_FILTER_DESCRIPTOR::default();
-            let callstacks_filter = Self::build_event_filter(&self.callstacks);
+            callstacks_filter = Self::build_event_filter(&self.callstacks);
             callstacks.Type = EVENT_FILTER_TYPE_STACKWALK;
             callstacks.Filter = callstacks_filter.as_ptr();
             callstacks.Size = callstacks_filter.len() as u32;
@@ -803,13 +830,18 @@ impl TraceEnable {
             let mut pids = EVENT_FILTER_DESCRIPTOR::default();
             pids.Type = EVENT_FILTER_TYPE_PID;
 
-            let mut callstack_kw_filter = EVENT_FILTER_LEVEL_KW::default();
+            // Populate the filter before taking its address: writing through the
+            // local after the pointer is created would invalidate that pointer.
+            let mut kw_filter = EVENT_FILTER_LEVEL_KW::default();
+            if let Some(callstack_keyword) = self.callstack_keyword {
+                kw_filter.FilterIn = 1;
+                kw_filter.MatchAnyKeyword = callstack_keyword;
+            }
+            callstack_kw_filter = kw_filter;
             let mut callstack_kw = EVENT_FILTER_DESCRIPTOR::default();
             callstack_kw.Type = EVENT_FILTER_TYPE_STACKWALK_LEVEL_KW;
             callstack_kw.Filter = &callstack_kw_filter as *const EVENT_FILTER_LEVEL_KW as *const u8;
             callstack_kw.Size = std::mem::size_of::<EVENT_FILTER_LEVEL_KW>() as u32;
-
-            let mut filters = Vec::new();
 
             if let Some(custom) = &self.custom_filter {
                 let mut custom_desc = EVENT_FILTER_DESCRIPTOR::default();
@@ -841,10 +873,7 @@ impl TraceEnable {
                 }
             }
 
-            if let Some(callstack_keyword) = self.callstack_keyword {
-                callstack_kw_filter.FilterIn = 1;
-                callstack_kw_filter.MatchAnyKeyword = callstack_keyword;
-
+            if self.callstack_keyword.is_some() {
                 filters.push(callstack_kw);
             }
 
@@ -853,20 +882,10 @@ impl TraceEnable {
             params.FilterDescCount = filters.len() as u32;
         }
 
-        unsafe {
-            let result = EnableTraceEx2(
-                handle,
-                &self.provider,
-                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                self.level,
-                self.keyword,
-                0,
-                0,
-                &params);
+        let result = enable_trace(&params);
 
-            if result != 0 {
-                anyhow::bail!("EnableTraceEx2 failed with {}", result);
-            }
+        if result != 0 {
+            anyhow::bail!("EnableTraceEx2 failed with {}", result);
         }
 
         Ok(())
@@ -1215,5 +1234,101 @@ impl TraceSession {
 impl Drop for TraceSession {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_filter(
+        params: &ENABLE_TRACE_PARAMETERS,
+        filter_type: u32) -> &[u8] {
+        let descs = unsafe {
+            std::slice::from_raw_parts(
+                params.EnableFilterDesc,
+                params.FilterDescCount as usize)
+        };
+
+        let desc = descs
+            .iter()
+            .find(|desc| desc.Type == filter_type)
+            .expect("filter descriptor should be present");
+
+        unsafe { std::slice::from_raw_parts(desc.Filter, desc.Size as usize) }
+    }
+
+    #[test]
+    fn enable_filters_are_readable_during_enable_call() {
+        const CUSTOM_FILTER_TYPE: u32 = 0x80000400;
+
+        let mut enable = TraceEnable::new(Guid::from_u128(0x1234));
+        enable.add_event(1, true);
+        enable.add_event(2, false);
+        enable.ensure_callstack_keyword(0x40);
+        enable.ensure_custom_filter(CUSTOM_FILTER_TYPE, vec![1, 2, 3, 4]);
+        let target_pids = Some(vec![100, 200]);
+
+        let mut called = false;
+
+        enable.enable_with(&target_pids, |params| {
+            called = true;
+
+            assert_eq!(5, params.FilterDescCount);
+            assert_ne!(0, params.EnableProperty & EVENT_ENABLE_PROPERTY_STACK_TRACE);
+
+            assert_eq!(
+                &[1, 2, 3, 4],
+                find_filter(params, CUSTOM_FILTER_TYPE));
+
+            assert_eq!(
+                TraceEnable::build_event_filter(&vec![1, 2]),
+                find_filter(params, EVENT_FILTER_TYPE_EVENT_ID));
+
+            assert_eq!(
+                TraceEnable::build_event_filter(&vec![1]),
+                find_filter(params, EVENT_FILTER_TYPE_STACKWALK));
+
+            let mut expected_pids = Vec::new();
+            expected_pids.extend_from_slice(&100i32.to_ne_bytes());
+            expected_pids.extend_from_slice(&200i32.to_ne_bytes());
+            assert_eq!(
+                expected_pids,
+                find_filter(params, EVENT_FILTER_TYPE_PID));
+
+            let kw = find_filter(params, EVENT_FILTER_TYPE_STACKWALK_LEVEL_KW);
+            assert_eq!(std::mem::size_of::<EVENT_FILTER_LEVEL_KW>(), kw.len());
+            let kw = unsafe { &*(kw.as_ptr() as *const EVENT_FILTER_LEVEL_KW) };
+            assert_eq!(0x40, kw.MatchAnyKeyword);
+            assert_eq!(1, kw.FilterIn);
+
+            0
+        }).unwrap();
+
+        assert!(called);
+    }
+
+    #[test]
+    fn enable_without_filtering_passes_no_filters() {
+        let mut enable = TraceEnable::new(Guid::from_u128(0x1234));
+        enable.add_event(1, true);
+        enable.ensure_callstack_keyword(0x40);
+        enable.ensure_no_filtering();
+
+        enable.enable_with(&Some(vec![100]), |params| {
+            assert_eq!(0, params.FilterDescCount);
+            assert!(params.EnableFilterDesc.is_null());
+
+            0
+        }).unwrap();
+    }
+
+    #[test]
+    fn enable_reports_enable_trace_failure() {
+        let enable = TraceEnable::new(Guid::from_u128(0x1234));
+
+        let err = enable.enable_with(&None, |_| 5).unwrap_err();
+
+        assert_eq!("EnableTraceEx2 failed with 5", err.to_string());
     }
 }
